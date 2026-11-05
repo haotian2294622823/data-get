@@ -1,0 +1,6 @@
+process_key,lot_no,pass_order,process_code,process_name
+P_ROOT_1,ROOT_A,1,E010,模拟第一工序
+P_ROOT_2,ROOT_A,2,E020,模拟第二工序
+P_B_1,MAT_B,1,E030,模拟B工序
+P_C_1,MAT_C,1,E040,模拟C工序
+P_D_1,MAT_D,1,E050,模拟D工序

@@ -1,0 +1,3 @@
+lot_no,process_key,pass_order,defect_code,defect_qty
+ROOT_A,P_ROOT_1,1,D01,1
+ROOT_A,P_ROOT_1,1,D02,2

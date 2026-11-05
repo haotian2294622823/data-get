@@ -1,0 +1,7 @@
+lot_no,pass_order,seq,material_lot_no,process_key,input_qty
+ROOT_A,1,1,MAT_B,P_ROOT_1,10
+ROOT_A,1,2,MAT_C,P_ROOT_1,20
+ROOT_A,2,1,MAT_B,P_ROOT_2,5
+MAT_B,1,1,MAT_D,P_B_1,8
+MAT_B,1,2,RAW_X,P_B_1,2
+MAT_C,1,1,MAT_D,P_C_1,10

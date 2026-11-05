@@ -1,0 +1,10 @@
+max_depth: 10
+max_nodes: 5000
+max_edges: 50000
+max_path_rows: 100000
+max_material_rows: 100000
+max_source_rows: 100000
+max_fields: 60
+preview_rows: 100
+max_csv_bytes: 10485760
+operation_seconds: 60

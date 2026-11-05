@@ -1,0 +1,4 @@
+# 仅三张核心表的已知合同；实际部署前仍需实库核验。不开放未知生产字段。
+config_version: real-v3-core-pending-validation
+datasets: [genealogy_edges, genealogy_paths, process_records, material_records]
+fields: []
