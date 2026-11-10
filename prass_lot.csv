@@ -1,0 +1,2 @@
+﻿lot_no,seiku,status,input_qty,output_qty,start_datetime,finish_datetime,actual_start_datetime,actual_finish_datetime,murata_type,toko_type,line_no,quality_flag,lot_flag
+E6X08010,Y26,1,48000.0,39000.0,2026-10-12 16:00:03,2026-10-22 15:26:13,2026-10-12 08:00:03,2026-10-22 07:26:13,DFE252012PD-1R0M=P2,DFE252012P,0812,2,F
