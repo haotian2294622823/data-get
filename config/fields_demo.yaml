@@ -1,5 +1,0 @@
-config_version: demo-v3
-datasets: [genealogy_edges, genealogy_paths, process_records, material_records, machine_records, defect_records]
-fields:
-  - {field_id: material.input_qty, label: 投入数量（模拟）, dataset: material_records, source_id: material_records, value_column: input_qty, grain: material_event, aggregation: identity, data_type: number, unit: 未指定, order: 1, allowed_process_codes: [], verified: true}
-  - {field_id: defect.quantity, label: 不良数量（模拟）, dataset: defect_records, source_id: defect_records, value_column: defect_qty, grain: defect_event, aggregation: identity, data_type: number, unit: 未指定, order: 2, allowed_process_codes: [], verified: true}
