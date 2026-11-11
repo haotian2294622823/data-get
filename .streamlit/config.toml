@@ -1,0 +1,15 @@
+[theme]
+base = "light"
+primaryColor = "#2463D4"
+backgroundColor = "#F8FAFE"
+secondaryBackgroundColor = "#EFF4FC"
+textColor = "#172B4D"
+borderColor = "#D8E2F0"
+blueColor = "#2463D4"
+baseRadius = "0.6rem"
+buttonRadius = "0.6rem"
+headingFontSizes = ["2rem", "1.5rem", "1.15rem", "1rem", "1rem", "1rem"]
+showWidgetBorder = true
+
+[server]
+enableStaticServing = false

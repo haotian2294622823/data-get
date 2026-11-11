@@ -1,22 +1,46 @@
 ﻿# 制造数据抽取项目
 
-页面支持按 LOT 号、批次实际结束日期、品番精确查询。品番字段可选 `murata_type` 或 `toko_type`，填写多个条件时取交集。日期包含开始日和结束日，按 `DB_TIMEZONE` 判断自然日，默认 `Asia/Shanghai`。
+按系统 LOT、批次实际结束日期、品番查询。填写多个条件时取交集。前工程按直接用料的 `material_lot_no` 回库查询，使用材料自身的 LOT，日期和品番只筛系统 LOT。
 
 ## 启动
 
-在项目目录安装依赖，将 `.env.example` 复制为 `.env` 后填入 PostgreSQL 只读账号和 `APP_PASSWORD`。已有 `.env` 时沿用原文件。六张表须位于配置的 `DB_SCHEMA`（默认 `public`）。
+在项目目录安装依赖并运行：
 
 ```powershell
 python -m pip install -r requirements.txt
 python -m streamlit run app.py --server.address 127.0.0.1
 ```
 
-使用终端给出的地址进入页面，输入 `APP_PASSWORD` 登录。查询成功后点击「下载合并宽表 CSV」。每个 LOT 一行，工序和明细按现有 `merge_csv.py` 规则展开。
+页面使用 `.env` 的 `APP_PASSWORD` 登录。DFEC 沿用现有 `DB_HOST`、`DB_PORT`、`DB_NAME`、`DB_USER`、`DB_PASSWORD`、`DB_SCHEMA`、`DB_TIMEZONE`、`DB_SSLMODE`。默认 Schema 为 `public`，日期时区为 `Asia/Shanghai`。
 
-## 原始文件
+接入结构和关联键相同的另一个产品时，在同一份本地 `.env` 增加产品代码和带前缀的连接设置：
 
-后端默认保存到 `outputs/queries/<UTC时间_查询ID>/`，每次成功读取对应六张原始表各一份 CSV。空表保留表头，未命中 LOT 的查询也会留存六份表头。可用 `EXPORT_DIR` 配置目录。原始文件供后端查看，页面仅提供合并宽表下载。
+```dotenv
+LOT_PRODUCTS=DFEC,ABC
+ABC_DB_HOST=
+ABC_DB_PORT=5432
+ABC_DB_NAME=
+ABC_DB_USER=
+ABC_DB_PASSWORD=
+ABC_DB_SCHEMA=public
+ABC_DB_TIMEZONE=Asia/Shanghai
+```
 
-单次最多读取 500 个 LOT、合计 100,000 条源记录和 64 MiB 原始 CSV。宽表超过列数、单元格数或文件大小上限时请缩小查询范围。若源记录无法按现有键区分，原始 CSV 已保存，可在后端核对后再合并。
+重启后，页面会显示产品数据库选择。每次查询只使用选中的连接。所有产品须提供相同的七张表和关联字段。
 
-`python get_bylot.py <LOT>` 可直接在命令行存档某个 LOT 的六张原始表。`python merge_csv.py <CSV目录> --output <宽表.csv>` 可离线合并某次存档。
+## 原始文件和合并宽表
+
+每次查询保存到 `outputs/queries/<产品>/<查询编号>/`。可用 `EXPORT_DIR` 指定存档根目录。系统 LOT 的七份原始表和前工程的四份 `upstream_*.csv` 在同一个目录。前工程四表包括批次、工序、不良和机台设备。空表保留表头。
+
+页面下载每个系统 LOT 一行的宽表。前工程列用原始材料类别名加序号，例如 `DFEC-I-Core_1_材料LOT`。同一系统 LOT 中，重复用到同一材料时共用列组，每条用料记录保留对该组的引用。材料没有批次记录时，保留编号和查询状态。
+
+页面默认限制 5,000 个系统 LOT、100,000 条原始记录、64 MiB 原始 CSV 和 400 万宽表单元格。可通过 `MAX_QUERY_LOTS`、`MAX_SOURCE_ROWS`、`MAX_CSV_MIB`、`MAX_WIDE_CELLS` 调整。读取过程中检查行数和大小，超限会中止并提示缩小范围。
+
+## 手动工具
+
+```powershell
+python get_bylot.py LOT123 --product DFEC
+python merge_csv.py "outputs/queries/DFEC/查询编号" --output "outputs/宽表.csv"
+```
+
+`get_bylot.py` 单独运行时只取数和存档。省略 LOT 参数会提示输入。 `merge_csv.py` 单独运行时读取指定目录的原始 CSV，沿用系统的合并规则。页面和两个手动入口共用 `lot_extract/` 内的业务代码。
