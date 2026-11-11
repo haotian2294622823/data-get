@@ -21,7 +21,7 @@ from merge_csv import TABLES, merge_tables
 BASE = Path(__file__).resolve().parent
 LOT_TABLE = "prass_lot"
 PRODUCT_FIELDS = ("murata_type", "toko_type")
-MAX_LOTS = 500
+MAX_LOTS = 5000
 MAX_ROWS = 100_000
 MAX_BYTES = 64 * 1024 * 1024
 NUMBER = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")

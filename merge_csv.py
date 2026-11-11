@@ -24,7 +24,10 @@ TABLES = {
         "不良",
         ("lot_no", "process_key", "pass_order", "defect_code"),
     ),
-    "prass_process_material": ("材料", ("lot_no", "process_key", "pass_order", "seq")),
+    "prass_process_material": (
+        "材料",
+        ("lot_no", "process_key", "pass_order", "seq"),
+    ),
     "prass_process_tool": (
         "工具",
         ("lot_no", "process_key", "pass_order", "tool_code"),
@@ -32,6 +35,10 @@ TABLES = {
     "prass_process_worker": (
         "人员",
         ("lot_no", "process_key", "pass_order", "worker_code"),
+    ),
+    "prass_process_machine": (
+        "机台设备",
+        ("lot_no", "process_key", "pass_order", "machine_code"),
     ),
 }
 BATCH_FIELDS = {"lot_no", "seiku", "murata_type", "toko_type", "lot_flag"}
