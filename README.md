@@ -24,6 +24,57 @@
 
 页面主流程是 `ui.py → jobs.py → batch_export.py`。修改制造展开看 `merge.py`，修改材料展开看 `material_merge.py`，工程别名和展示选项改 `material_rules.json`。
 
+## 项目流程图
+
+### 整体导出流程
+
+下面是页面查询和 `cli.py export` 共用的批量导出流程。每批处理完整的系统 LOT，原始数据和中间结果逐批落盘。
+
+```mermaid
+flowchart TD
+    Web["app.py / ui.py<br/>登录并填写 LOT、日期或品番"] --> Job["jobs.py<br/>提交后台任务"]
+    Cli["cli.py export<br/>命令行填写查询条件"] --> Export
+    Job --> Export["batch_export.py<br/>组织批量导出"]
+    Export --> Page["database.py<br/>筛选并分页读取系统 LOT<br/>更新已找到数量"]
+    Page --> Source["读取本批系统七表<br/>收集材料 LOT，复用缓存或回查前工程四表"]
+    Source --> Archive["保存本批原始 CSV<br/>archives/part_*/"]
+    Archive --> Merge["tables.py 校验原始 CSV<br/>merge.py + material_merge.py 展开宽表"]
+    Merge --> Part["保存本批宽表 part_*.csv<br/>更新已整理行数和任务清单"]
+    Part --> More{"还有下一批？"}
+    More -->|有| Page
+    More -->|没有| Release["结束数据库只读快照<br/>清理本次任务的材料缓存"]
+    Release --> Join["final_export.py<br/>收集全部列名，逐行对齐，缺列补空"]
+    Join --> File["生成唯一的 final.csv<br/>每个制造 LOT 一行"]
+    File -->|页面任务| Result["ui.py<br/>显示行数、列数和文件大小"]
+    File -->|命令行任务| Terminal["CLI 输出完成信息与结果目录"]
+    Result --> Download["downloads.py<br/>校验下载凭证，流式发送完整 CSV"]
+```
+
+- 页面每两秒读取后台进度快照；查询阶段显示递增数量，最终 CSV 生成阶段显示写入进度条。
+- 查询没有结果时记录零行任务，不生成 CSV；取消或失败时保留已完成的中间结果。上图展示正常有数据的路径。
+- 单批超过资源上限时自动拆成更小的批次重试；单个 LOT 仍超限会报错，不截断记录。
+
+### 材料 LOT 如何展开到同一行
+
+关联方向是 **制造用料的 `material_lot_no` → 前工程的 `lot_no`**。材料增加的是工序0列组，最终行的主键始终是制造 `lot_no`。
+
+```mermaid
+flowchart TD
+    System["制造批次<br/>系统 lot_no"] --> Usage["制造用料记录<br/>收集直接使用的 material_lot_no"]
+    Usage --> Lookup["按材料编号匹配前工程 lot_no<br/>本次任务已查过的材料复用缓存"]
+    Lookup --> Process["取得材料的实际工程记录<br/>material_merge.py 关联与展开"]
+    Rules["material_rules.json<br/>工程别名、排序、编号依据与展示明细"] -.-> Process
+    Process --> Core["E-Core / I-Core<br/>每次工程执行各占一组<br/>保留材料 LOT 与工艺字段"]
+    Process --> Winding["卷线<br/>按不同材料 LOT 编号<br/>保留工艺、设备和不良明细"]
+    Core --> StageZero["生成动态工序0列组<br/>按制造用料关系挂回对应的制造 LOT"]
+    Winding --> StageZero
+    System --> Manufacturing["merge.py<br/>制造批次信息及制造工程展开"]
+    StageZero --> Row["同一个制造 LOT 的一行宽表<br/>批次信息 → 工序0 → 制造工序1及后续"]
+    Manufacturing --> Row
+```
+
+材料查询只使用材料 LOT，不附加制造批次的日期或品番条件，也不递归查询材料的上游。E-Core、I-Core 不展开设备和不良；卷线同一材料的重复引用共用编号，额外执行保留在该材料组内。未识别工程或未匹配明细保留在异常列组，并产生核对提示。
+
 ## 启动
 
 在项目目录安装依赖并运行：
