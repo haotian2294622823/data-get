@@ -1,7 +1,7 @@
 """离线合并原始 CSV，产出“每个系统 LOT 一行”的全字段宽表。
 
-主流程：read_tables 校验原始表 → merge_records 展开各 LOT 的工序和明细 →
-merge_tables 按用料关系追加前工程列组 → write_wide 按统一列顺序输出。
+主流程：制造 LOT 独立合并 → 材料按 process_name 分工程独立合并 →
+按原始用料关系拼到同一系统 LOT 行 → write_wide 输出。
 本模块不连接数据库。材料回库查询由 service.py 完成，合并只使用本次存档文件。
 """
 
@@ -11,9 +11,10 @@ import csv
 import re
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 from pathlib import Path
 
-from .schema import DEFECT, LOT, MACHINE, MATERIAL, PROCESS, TABLES, UPSTREAM_PREFIX, UPSTREAM_TABLES, validate_columns
+from .schema import DEFECT, LOT, MACHINE, MATERIAL, PROCESS, TABLES, UPSTREAM_PREFIX, UPSTREAM_TABLES, ExportSizeError, validate_columns
 
 # CSV 中所有值保留为字符串，避免 LOT 前导零、编号格式和原始小数表示被改写。
 Row = dict[str, str]
@@ -30,6 +31,7 @@ PROCESS_FIELDS = {
 }
 
 
+@lru_cache(maxsize=8192)
 def numeric_order(value: str) -> tuple[int, Decimal, str]:
     """生成排序键，让数值 2 排在 10 前面；无法转数值的文本排在数值之后。
 
@@ -110,7 +112,7 @@ def check_shape(width: int, height: int, max_columns: int | None, max_cells: int
     if (max_columns is not None and width > max_columns) or (
         max_cells is not None and width * height > max_cells
     ):
-        raise ValueError("合并宽表超出大小上限，请缩小查询范围。")
+        raise ExportSizeError("合并宽表超出大小上限，请缩小查询范围。")
 
 
 def merge_records(
@@ -119,13 +121,14 @@ def merge_records(
     *,
     max_columns: int | None = None,
     max_cells: int | None = None,
-    references: dict[tuple[str, str], str] | None = None,
+    flat_details: bool = False,
 ) -> tuple[list[str], list[Row], list[str]]:
     """将一组 LOT 的批次、工序和明细展开，返回（列名，宽表行，差异提示）。
 
     系统 LOT 和材料 LOT 都调用这个函数，各自按自己的 pass_order 排序。
-    references 可选，结构为 {(系统 LOT, 材料 LOT): 列组名称}；提供它时，
-    用料记录中的材料编号显示为列组引用，真实材料编号保留在该列组的“材料LOT”列。
+    flat_details 为真时，明细直接放在材料列组下，不再加道次或工程名前缀；
+    工程原始字段放在“工程记录N”下，明细保留关联键以便核对所属工程。
+    用料记录保留原始 material_lot_no，系统 LOT 与材料 LOT 因此能在同一行对照。
     本函数假定输入已通过 read_tables 的格式和唯一性校验。
     """
     lots = {r["lot_no"]: r for r in tables[LOT]}
@@ -155,33 +158,39 @@ def merge_records(
     for source in by_lot:
         is_process = source == PROCESS
         candidates = BATCH_FIELDS if is_process else BATCH_FIELDS | PROCESS_FIELDS
-        for field in sorted(candidates & set(headers[source])):
-            mismatches = 0
-            for row in tables[source]:
-                lot = lots[row["lot_no"]]
-                parent = (
-                    lot
-                    if is_process
-                    else processes.get((row["lot_no"], row["process_key"]), {})
+        fields = sorted(candidates & set(headers[source]))
+        mismatches = dict.fromkeys(fields, 0)
+        # 每条记录只查一次父记录，不再为每个待检查字段重扫整张表。
+        for row in tables[source]:
+            lot = lots[row["lot_no"]]
+            parent = lot if is_process else processes.get((row["lot_no"], row["process_key"]), {})
+            for field in fields:
+                expected = (
+                    lot.get(field)
+                    if field in BATCH_FIELDS and field not in parent
+                    else parent.get(field)
                 )
-                if field in BATCH_FIELDS and field not in parent:
-                    parent = lot
-                actual, expected = row[field], parent.get(field)
+                actual = row[field]
                 same = expected is not None and (
                     pass_text(actual) == pass_text(expected)
                     if field == "pass_order"
                     else actual == expected
                 )
                 if not same:
-                    mismatches += 1
-            if mismatches:
+                    mismatches[field] += 1
+        for field in fields:
+            if mismatches[field]:
                 notices.append(
-                    f"{source}.{field} 有 {mismatches} 条与父记录不同或缺少父值，已保留该字段"
+                    f"{source}.{field} 有 {mismatches[field]} 条与父记录不同或缺少父值，已保留该字段"
                 )
             else:
                 skipped[source].add(field)
-    # 道次已经写进工序列名前缀，不再单列。
-    skipped[PROCESS].add("pass_order")
+    # 材料明细不再靠工序前缀定位，保留关联字段；系统道次仍体现在列名中。
+    if flat_details:
+        for source in details:
+            skipped[source].difference_update(PROCESS_FIELDS)
+    else:
+        skipped[PROCESS].add("pass_order")
 
     # 不良名称适合做列名，但可能同名不同码或同码不同名，需要双向检查歧义。
     name_codes: dict[str, set[str]] = defaultdict(set)
@@ -222,14 +231,15 @@ def merge_records(
                 check_shape(len(column_order) + 1, len(lots), max_columns, max_cells)
                 column_order[column] = rank
 
-        for process in process_list:
+        for process_position, process in enumerate(process_list, 1):
             pass_no = pass_text(process["pass_order"])
-            counts[pass_no] += 1
-            execution = counts[pass_no]
-            # 同一道次可能有多次不同 process_key 的执行，追加“执行2”等编号区分。
-            # 每个 LOT 单独计数，因此材料工序1不会与制造工序1混在同一排序空间。
+            head = "工序" + label(pass_no)
+            counts[head] += 1
+            execution = counts[head]
             prefix = (
-                "工序" + label(pass_no) + (f"_执行{execution}" if execution > 1 else "")
+                f"工程记录{process_position}"
+                if flat_details
+                else head + (f"_执行{execution}" if execution > 1 else "")
             )
             rank = (1, numeric_order(process["pass_order"]), execution)
             prefixes[process["process_key"]] = prefix, rank
@@ -256,6 +266,8 @@ def merge_records(
                     notices.append(f"{source} 有未匹配工序明细，已保留在未匹配分组")
                 else:
                     prefix, rank = prefixes[row["process_key"]]
+                    if flat_details:
+                        prefix = ""
                 if source == DEFECT:
                     code, name = row["defect_code"], row["defect_name"]
                     if not code:
@@ -274,8 +286,8 @@ def merge_records(
                     group_counts[prefix, title] += 1
                     position = group_counts[prefix, title]
                     detail = (
-                        prefix
-                        + "_不良_"
+                        (prefix + "_" if prefix else "")
+                        + "不良_"
                         + title
                         + (f"_记录{position}" if position > 1 else "")
                     )
@@ -292,7 +304,7 @@ def merge_records(
                     # 不把多张一对多明细表直接 JOIN，避免组合后行数膨胀、数量重复。
                     group_counts[prefix, source] += 1
                     position = group_counts[prefix, source]
-                    detail = f"{prefix}_{TABLES[source][0]}{position}"
+                    detail = (prefix + "_" if prefix else "") + f"{TABLES[source][0]}{position}"
                     event_order = (position,)
                 for field_index, field in enumerate(headers[source]):
                     # 未匹配组不能靠工序前缀还原关联信息，须保留原始键与时间。
@@ -310,14 +322,9 @@ def merge_records(
                         suffix = "代码" if field == "defect_code" else field
                     else:
                         suffix = field
-                    value = row[field]
-                    if source == MATERIAL and field == "material_lot_no" and references is not None:
-                        # 原始用料行仍逐条存在，只把重复材料编号替换为对应的前工程列组名。
-                        suffix = "材料分组"
-                        value = references.get((lot_no, value), value)
                     put(
                         detail + "_" + suffix,
-                        value,
+                        row[field],
                         rank + (source_index, event_order, field_index),
                     )
         result.append(output)
@@ -326,50 +333,18 @@ def merge_records(
     return columns, result, notices
 
 
-def material_groups(records: list[Row]) -> dict[tuple[str, str], str]:
-    """为每个（系统 LOT，材料 LOT）确定列组，例如 DFEC-I-Core_1。
-
-    同一系统 LOT 多次使用同一材料时，共用一个列组，类别采用首次使用记录。
-    类别内序号按用料工序/seq 的排序依次分配，并在每个系统 LOT 内重新计数。
-    因此不同系统 LOT 的 DFEC-I-Core_1 不一定是同一材料，身份以“材料LOT”列为准。
-    """
-    used_names: dict[str, set[str]] = defaultdict(set)
-    for row in records:
-        name = row.get("material_class_name", "").strip()
-        if name:
-            used_names[name].add(row.get("material_class_code", ""))
-    groups: dict[tuple[str, str], str] = {}
-    counts: dict[tuple[str, str], int] = defaultdict(int)
-    ordered = sorted(records, key=lambda r: (
-        r["lot_no"], numeric_order(r["pass_order"]), r["process_key"],
-        numeric_order(r["seq"]), r["material_lot_no"],
-    ))
-    for row in ordered:
-        lot, material = row["lot_no"], row["material_lot_no"]
-        # 只去重展示分组；records 本身不删除，后续仍能保留全部使用记录。
-        if not material.strip() or (lot, material) in groups:
-            continue
-        code = row.get("material_class_code", "")
-        name = row.get("material_class_name", "").strip()
-        category = name or (f"材料类别{code}" if code else "未分类材料")
-        # 优先使用真实类别名；同名不同代码时补代码消歧，不硬编码 I-Core/E-Core 等名称。
-        if len(used_names[name]) > 1:
-            category += f"（{code or '无代码'}）"
-        category = category.replace("\r", " ").replace("\n", " ")
-        counts[lot, category] += 1
-        groups[lot, material] = f"{category}_{counts[lot, category]}"
-    return groups
-
-
 def merge_tables(
     base_dir: Path | str, *, max_columns: int | None = None, max_cells: int | None = None
 ) -> tuple[list[str], list[Row], list[str]]:
     """读取一次查询的存档，合并系统记录，再把直接材料的前工程列挂回系统行。
 
     兼容没有 upstream 文件的旧存档；一旦出现前工程文件，就要求四张全部齐备。
-    材料缺失时保留编号与状态，有真实明细但缺批次主记录时仍保留这些明细。
+    材料缺批次主记录时，有真实明细的仍保留这些明细。
     返回的 rows 始终以系统 LOT 为行，材料 LOT 只增加列组，不增加系统批次行数。
     """
+    # 材料模块复用本文件的单 LOT 展开函数，延迟导入避免循环初始化。
+    from .material_merge import merge_and_attach_materials
+
     base = Path(base_dir)
     upstream_files = [(base / f"{UPSTREAM_PREFIX}{table}.csv").exists() for table in UPSTREAM_TABLES]
     has_upstream = any(upstream_files)
@@ -385,59 +360,22 @@ def merge_tables(
     if not all(upstream_files):
         raise ValueError("前工程 CSV 不完整，请检查本次查询目录。")
 
-    references = material_groups(tables[MATERIAL])
-    columns, rows, notices = merge_records(headers, tables, references=references, **limits)
-    upstream_headers, upstream = read_tables(base, UPSTREAM_TABLES, UPSTREAM_PREFIX)
-    requested = {material for _, material in references}
-    present = {row["lot_no"] for row in upstream[LOT]}
-    details = {row["lot_no"] for table in UPSTREAM_TABLES[1:] for row in upstream[table]}
-    if (present | details) - requested:
-        # 防止不同查询的文件被误放到一起，混入用料关系之外的材料 LOT。
-        raise ValueError("前工程 CSV 包含用料关系中不存在的 LOT，请核对查询目录。")
-    # 只有明细、没有材料批次主记录时，补一个仅含 LOT 的占位行供共用合并函数使用。
-    # present 保留原始主记录集合，因此最终状态仍能明确标注“缺批次记录”。
-    for lot in sorted(details - present):
-        upstream[LOT].append({field: lot if field == "lot_no" else "" for field in upstream_headers[LOT]})
-    upstream_columns, upstream_rows, upstream_notices = merge_records(
-        upstream_headers, upstream, max_columns=max_columns
+    # 第一阶段：只合并制造 LOT；用料原始字段仍保留在制造结果中。
+    columns, rows, notices = merge_records(headers, tables, **limits)
+    system_columns = columns
+    # 第二、三阶段由材料模块完成：分工程合并，再按用料关系拼接。
+    columns, upstream_notices = merge_and_attach_materials(
+        base, columns, rows, tables[MATERIAL], **limits
     )
-    field_order = {"材料LOT": 0, "状态": 1}
-    field_order.update({field: i for i, field in enumerate(upstream_columns, 2)})
-    upstream_by_lot = {
-        row["lot_no"]: sorted(
-            ((field, value) for field, value in row.items() if field != "lot_no"),
-            key=lambda item: field_order[item[0]],
-        )
-        for row in upstream_rows
-    }
-    # 两种索引分别回答：“这个材料有什么数据？”和“这个系统 LOT 使用哪些材料？”
-    # 共享材料的数据只合并一次，再依各自的原始使用关系挂到多个系统 LOT 上。
-    groups_by_lot: dict[str, list[tuple[str, str]]] = defaultdict(list)
-    for (lot, material), group in references.items():
-        groups_by_lot[lot].append((material, group))
-
-    primary_columns = set(columns)
-    group_order: dict[str, int] = {}
-    added: dict[str, tuple[int, int]] = {}
-    for row in rows:
-        for material, group in groups_by_lot[row["lot_no"]]:
-            group_order.setdefault(group, len(group_order))
-            status = "已找到" if material in present else (
-                "有明细，缺批次记录" if material in details else "未查到前工程记录"
-            )
-            fields = [("材料LOT", material), ("状态", status)]
-            fields.extend(upstream_by_lot.get(material, []))
-            for field, value in fields:
-                # 前缀先用真实材料类别+序号，再接材料自己的工序列名：
-                # DFEC-I-Core_1_工序1_不良_裂纹，与系统“工序1_不良_裂纹”互不冲突。
-                column = f"{group}_{field}"
-                if column in primary_columns or column in row:
-                    raise ValueError(f"前工程列名冲突：{column}")
-                if column not in added:
-                    check_shape(len(columns) + len(added) + 1, len(rows), max_columns, max_cells)
-                    added[column] = (group_order[group], field_order[field])
-                row[column] = value
-    return [*columns, *sorted(added, key=added.__getitem__)], rows, [*notices, *upstream_notices]
+    # 批次身份信息在前，工序0紧随其后，再接原有制造工序；只调整列顺序。
+    system_fields = set(system_columns)
+    material_columns = [field for field in columns if field not in system_fields]
+    columns = [
+        *headers[LOT],
+        *material_columns,
+        *system_columns[len(headers[LOT]):],
+    ]
+    return columns, rows, [*notices, *upstream_notices]
 
 
 def spreadsheet_text(value: str) -> str:

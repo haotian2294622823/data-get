@@ -33,6 +33,10 @@ EXTRA_FIELDS = {
 }
 
 
+class ExportSizeError(ValueError):
+    """完整批次超出资源预算，可缩小 LOT 批次重试；不代表原始数据有误。"""
+
+
 def validate_columns(table: str, fields: list[str]) -> None:
     """检查关联/合并所需的最少字段，并拒绝会造成取值歧义的重复列名。
 

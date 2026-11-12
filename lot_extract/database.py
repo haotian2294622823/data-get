@@ -24,7 +24,7 @@ PRODUCT_FIELDS = ("murata_type", "toko_type")
 # 产品代码还会用于环境变量前缀和存档目录，因此只允许有限的安全字符。
 PROFILE_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,31}")
 # 每次从数据库游标取回的行数，不是整次查询的记录上限。
-FETCH_ROWS = 256
+FETCH_ROWS = 2048
 
 
 @dataclass(frozen=True)

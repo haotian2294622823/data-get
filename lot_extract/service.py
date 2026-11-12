@@ -19,13 +19,14 @@ from psycopg import sql
 
 from .database import BASE, Filters, database_snapshot, read_rows, setting
 from .merge import merge_tables, write_wide
-from .schema import LOT, MATERIAL, TABLES, UPSTREAM_PREFIX, UPSTREAM_TABLES, validate_columns
+from .presentation import filter_final_rows
+from .schema import LOT, MATERIAL, TABLES, UPSTREAM_PREFIX, UPSTREAM_TABLES, ExportSizeError, validate_columns
 
 # 以下限制针对一次导出，而非数据库本身的总数据量。
 # 行数和原始 CSV 字节数覆盖系统七表 + 材料四表的总和；宽表另行检查大小。
 DEFAULT_MAX_LOTS = 5_000
 DEFAULT_MAX_SOURCE_ROWS = 100_000
-DEFAULT_MAX_CSV_MIB = 64
+DEFAULT_MAX_CSV_MIB = 640
 DEFAULT_MAX_WIDE_CELLS = 4_000_000
 MAX_WIDE_COLUMNS = 16_384  # 与 Excel 工作表的最大列数对齐。
 
@@ -57,7 +58,7 @@ class BoundedCsv:
     def write_bytes(self, content: bytes) -> None:
         """在写入前检查上限，超限抛错而不是留下看似完整的截断文件。"""
         if self.size + len(content) > self.available:
-            raise ValueError(f"{self.label}超过文件大小上限，请缩小查询范围。")
+            raise ExportSizeError(f"{self.label}超过文件大小上限，请缩小查询范围。")
         self.stream.write(content)
         self.size += len(content)
 
@@ -76,6 +77,8 @@ def archive_query(
     仅查直接使用的材料，不递归展开材料的上游；任一步骤失败就不发布该次存档。
     """
     where, params = filters.where()
+    where = sql.SQL("({}) AND lot_no LIKE %s AND lot_no NOT LIKE %s").format(where)
+    params = [*params, "E%", "%E%E%"]
     max_lots = limit("MAX_QUERY_LOTS", DEFAULT_MAX_LOTS)
     max_rows = limit("MAX_SOURCE_ROWS", DEFAULT_MAX_SOURCE_ROWS)
     max_bytes = limit("MAX_CSV_MIB", DEFAULT_MAX_CSV_MIB) * 1024 * 1024
@@ -184,6 +187,7 @@ def merged_download(archive: Path) -> tuple[bytes, int, list[str]]:
         max_columns=MAX_WIDE_COLUMNS,
         max_cells=limit("MAX_WIDE_CELLS", DEFAULT_MAX_WIDE_CELLS),
     )
+    rows = filter_final_rows(rows)
     output = io.BytesIO()
     write_wide(
         BoundedCsv(output, limit("MAX_CSV_MIB", DEFAULT_MAX_CSV_MIB) * 1024 * 1024, "合并宽表"),

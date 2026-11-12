@@ -13,6 +13,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from lot_extract.merge import merge_tables, write_wide
+from lot_extract.presentation import filter_final_rows
 from lot_extract.schema import TABLES, UPSTREAM_PREFIX, UPSTREAM_TABLES
 
 
@@ -30,6 +31,8 @@ def main(base_dir: str | Path | None = None, output_path: str | Path | None = No
     if destination.resolve() in {(base / source).resolve() for source in sources}:
         raise ValueError("输出文件不能覆盖原始表。")
     columns, rows, notices = merge_tables(base)
+    total = len(rows)
+    rows = filter_final_rows(rows)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
     try:
@@ -46,6 +49,8 @@ def main(base_dir: str | Path | None = None, output_path: str | Path | None = No
         if temporary is not None:
             temporary.unlink(missing_ok=True)
     print(f"已合并：{len(rows)} 个系统 LOT，{len(columns)} 列 -> {destination}")
+    if total != len(rows):
+        print(f"最终呈现仅保留 E 开头的系统 LOT，已排除 {total - len(rows)} 行。")
     for notice in notices:
         print("提示：" + notice)
     return destination
