@@ -19,7 +19,10 @@ class ExportJob:
         self.cancel = Event()
         self.future: Future | None = None
         self._lock = Lock()
-        self._state = {"status": "queued", "stage": "等待后台执行", "rows": 0, "parts": []}
+        self._state = {
+            "status": "queued", "stage": "等待后台执行",
+            "found_lots": 0, "rows": 0, "parts": [],
+        }
 
     def update(self, state: dict) -> None:
         with self._lock:

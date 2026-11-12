@@ -1,6 +1,6 @@
 """命令行批量导出：python export_batches.py --start 2026-01-01 --end 2026-12-31。
 
-每批独立处理，完成后流式拼接完整 CSV 并打包 ZIP，不把全年结果放入内存。
+每批独立处理，完成后流式拼接完整 CSV，不把全年结果放入内存。
 """
 
 from __future__ import annotations
@@ -33,6 +33,6 @@ if __name__ == "__main__":
         )
         print(f"已完成：{result['rows']} 个 E 系统 LOT。结果目录：{result['directory']}")
         if result.get("final_csv"):
-            print("完整宽表：final.csv；完整结果包：result.zip。分片仅作中间存档。")
+            print("完整宽表：final.csv。分片仅作中间存档。")
     except (Exception, KeyboardInterrupt) as error:
         parser.exit(1, error_message(error) + "\n")

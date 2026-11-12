@@ -1,0 +1,5 @@
+[
+  {"name": "E-Core", "aliases": ["E-Core", "E-Core成型"], "number_by": "execution", "details": []},
+  {"name": "I-Core", "aliases": ["I-Core", "I-Core成型"], "number_by": "execution", "details": []},
+  {"name": "卷线", "aliases": ["卷线", "卷线前工程", "卷线工程", "winding"], "number_by": "material_lot", "details": ["machine", "defect"]}
+]

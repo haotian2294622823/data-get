@@ -1,4 +1,4 @@
-"""取数编排层：筛选系统 LOT → 存档七表 → 回查材料四表 → 提供合并下载。
+"""单次取数编排：筛选系统 LOT → 存档七表 → 回查材料四表。
 
 材料关联从 prass_process_material.material_lot_no 得到，回库时用它匹配 lot_no。
 日期和品番仅筛选系统 LOT，不能带到材料查询中，否则会漏掉更早完工的前工程。
@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import codecs
 import csv
-import io
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,8 +17,6 @@ from uuid import uuid4
 from psycopg import sql
 
 from .database import BASE, Filters, database_snapshot, read_rows, setting
-from .merge import merge_tables, write_wide
-from .presentation import filter_final_rows
 from .schema import LOT, MATERIAL, TABLES, UPSTREAM_PREFIX, UPSTREAM_TABLES, ExportSizeError, validate_columns
 
 # 以下限制针对一次导出，而非数据库本身的总数据量。
@@ -174,23 +171,3 @@ def archive_query(
         destination.parent.mkdir(exist_ok=True)
         raw.rename(destination)
     return destination, len(primary)
-
-
-def merged_download(archive: Path) -> tuple[bytes, int, list[str]]:
-    """从已完成的存档生成下载内容，返回（CSV 字节，列数，数据差异提示）。
-
-    原始 CSV 保留在后端；这里生成的宽表字节交给页面下载。
-    合并阶段限制列数和“行数 × 列数”，编码阶段再限制下载文件的实际字节数。
-    """
-    columns, rows, notices = merge_tables(
-        archive,
-        max_columns=MAX_WIDE_COLUMNS,
-        max_cells=limit("MAX_WIDE_CELLS", DEFAULT_MAX_WIDE_CELLS),
-    )
-    rows = filter_final_rows(rows)
-    output = io.BytesIO()
-    write_wide(
-        BoundedCsv(output, limit("MAX_CSV_MIB", DEFAULT_MAX_CSV_MIB) * 1024 * 1024, "合并宽表"),
-        columns, rows,
-    )
-    return output.getvalue(), len(columns), notices

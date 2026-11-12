@@ -4,6 +4,10 @@
 这里的候选键用于发现歧义记录，并不代表已检查数据库中的真实主键约束。
 """
 
+from decimal import Decimal, InvalidOperation
+from functools import lru_cache
+
+
 LOT = "prass_lot"
 PROCESS = "prass_lot_process"
 DEFECT = "prass_process_defect"
@@ -41,7 +45,7 @@ def validate_columns(table: str, fields: list[str]) -> None:
     """检查关联/合并所需的最少字段，并拒绝会造成取值歧义的重复列名。
 
     允许出现更多业务字段：取数采用 SELECT *，合并时会继续处理这些原始字段。
-    本函数只校验表头，记录级的候选键重复由 merge.read_tables 检查。
+    本函数只校验表头，记录级的候选键重复由 csv_io.read_tables 检查。
     """
     needed = set(TABLES[table][1]) | EXTRA_FIELDS.get(table, set())
     missing = needed - set(fields)
@@ -49,3 +53,25 @@ def validate_columns(table: str, fields: list[str]) -> None:
         raise ValueError(f"{table} 缺少字段：{', '.join(sorted(missing))}")
     if len(fields) != len(set(fields)):
         raise ValueError(f"{table} 存在重复列名")
+
+
+@lru_cache(maxsize=8192)
+def numeric_order(value: str) -> tuple[int, Decimal, str]:
+    """生成排序键，让数值 2 排在 10 前面；无法转数值的文本排在数值之后。
+
+    Decimal 避免浮点数比较误差；这里只生成排序依据，不改写原始编号或数量。
+    返回三元组中的首位区分数值/文本，后两位分别用于数值比较和文本比较。
+    """
+    try:
+        number = Decimal(value)
+        if number.is_finite():
+            return 0, number, ""
+    except InvalidOperation:
+        pass
+    return 1, Decimal(0), value
+
+
+def pass_text(value: str) -> str:
+    """统一道次的比较和列名前缀：1、1.0 视为同一道次，空值显示为“未提供”。"""
+    invalid, number, text = numeric_order(value)
+    return (text or "未提供") if invalid else format(number.normalize(), "f")

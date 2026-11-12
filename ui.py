@@ -3,7 +3,6 @@
 import hmac
 import os
 import secrets
-from time import monotonic
 
 import streamlit as st
 
@@ -15,20 +14,13 @@ st.set_page_config(page_title="制造数据抽取", page_icon=":material/databas
 load_settings()
 
 
-@st.fragment
-def brand_mark() -> None:
-    
-    if st.button(":blue[DATA / EXTRACT]", type="tertiary", key="brand_mark"):
-        now = monotonic()
-        started, count = st.session_state.get("_brand_taps", (now, 0))
-        if now - started > 10:
-            started, count = now, 0
-        count += 1
-        if count == 5:
-            st.toast("By TZH BE xht ✨", icon="💙")
-            st.session_state.pop("_brand_taps", None)
-        else:
-            st.session_state._brand_taps = (started, count)
+def format_file_size(size: int) -> str:
+    """按 1024 换算实际文件字节数，单位使用对应的 KiB / MiB / GiB。"""
+    value = float(size)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{int(value):,} B" if unit == "B" else f"{value:,.1f} {unit}"
+        value /= 1024
 
 
 password = os.getenv("APP_PASSWORD")
@@ -57,7 +49,7 @@ except ValueError as error:
     st.stop()
 
 with st.container(horizontal=True, horizontal_alignment="distribute", vertical_alignment="center"):
-    brand_mark()
+    st.caption(":blue[DATA / EXTRACT]")
     if st.button("退出登录", icon=":material/logout:", type="tertiary"):
         downloads.revoke(owner)
         if job := st.session_state.get("export_job"):
@@ -94,7 +86,6 @@ if submitted:
         filters = Filters(lot_no, product_field, product_number, start, end)
         st.session_state.export_job = job_manager.submit(filters, database_product)
         downloads.revoke(owner)
-        st.session_state.pop("download", None)
     except ValueError as error:
         st.error(str(error))
 
@@ -105,59 +96,62 @@ def export_status() -> None:
     if job is None:
         return
     state = job.snapshot()
-    if state["status"] in ("queued", "running"):
-        st.info(state["stage"])
-        if st.button("取消导出", key="cancel_export"):
-            job.cancel.set()
-            st.info("已请求取消，将在当前读取或合并步骤结束后停止。")
+    active = state["status"] in ("queued", "running")
+    st.subheader("查询结果", anchor=False)
+    if active:
+        # 状态只读取后台快照。定时刷新页面不会重新执行数据库查询。
+        label = "正在取消，请等待当前处理步骤结束" if job.cancel.is_set() else state["stage"]
+        st.status(label, state="running")
     elif state["status"] == "complete":
-        st.success(state["stage"])
+        if state.get("final_csv"):
+            st.success("查询完成，完整数据已准备好", icon="✅")
+        else:
+            st.info("没有找到符合条件的数据，请调整查询条件后重试。", icon="🔎")
     elif state["status"] == "cancelled":
-        st.warning(state["stage"])
+        st.warning("查询已取消，未生成完整结果。", icon="⏹️")
     else:
-        st.error(state.get("error", state["stage"]))
-    st.caption(f"已处理 {state['rows']} 个系统 LOT · 材料缓存命中 {state.get('cache_hits', 0)} 次")
+        st.error(state.get("error", state["stage"]), icon="⚠️")
 
-    def download_link(info: dict, label: str, mime: str, primary: bool = False) -> None:
+    if final_csv := state.get("final_csv"):
+        with st.container(horizontal=True):
+            st.metric("数据行数", f"{final_csv['rows']:,}", border=True)
+            st.metric("数据列数", f"{final_csv['columns']:,}", border=True)
+            st.metric("CSV 文件大小", format_file_size(final_csv["bytes"]), border=True)
+        st.caption("每行对应一个系统 LOT，行数不包含表头。")
+        notices = sum(part.get("notice_count", 0) for part in state["parts"])
+        if notices:
+            st.warning(f"本次导出有 {notices:,} 条字段或工序差异提示，相关记录已保留在完整结果中。")
+        if final_csv.get("exceeds_excel_columns") or final_csv.get("exceeds_excel_rows"):
+            st.warning("完整 CSV 超过 Excel 单工作表的行或列限制。数据未截断，请使用支持大文件的数据库工具读取。")
+
         directory = job.directory.resolve()
-        path = (directory / info["file"]).resolve()
+        path = (directory / final_csv["file"]).resolve()
         if path.parent != directory or not path.is_file():
             st.error("结果文件不存在或文件名无效。")
             return
         filename = f"{state['product']}_{job.directory.name}_{path.name}"
-        token = downloads.issue(owner, path, filename, mime)
+        token = downloads.issue(owner, path, filename, "text/csv")
         base = (st.get_option("server.baseUrlPath") or "").strip("/")
         url = f"/{base + '/' if base else ''}exports/{token}"
         # 链接请求由同端口文件接口按块发送，不经过 Streamlit 的内存下载缓存。
         st.link_button(
-            label, url, icon=":material/download:", width="stretch",
-            type="primary" if primary else "secondary",
+            "下载完整 CSV", url, icon="📥", width="stretch", type="primary",
         )
-
-    if final_csv := state.get("final_csv"):
-        st.subheader("完整结果", anchor=False)
-        st.caption(f"一份完整宽表：{final_csv['rows']} 行 · {final_csv['columns']} 列")
-        notices = sum(part["notice_count"] for part in state["parts"])
-        if notices:
-            st.warning(f"本次导出有 {notices} 条字段或工序差异提示，相关记录已保留在完整结果中。")
-        download_link(final_csv, "下载完整宽表 CSV", "text/csv", primary=True)
-        if final_zip := state.get("final_zip"):
-            download_link(final_zip, "下载完整结果 ZIP（含一份最终 CSV）", "application/zip")
-        if final_csv.get("exceeds_excel_columns") or final_csv.get("exceeds_excel_rows"):
-            st.warning("完整 CSV 超过 Excel 单工作表的行或列限制。数据未截断，请使用支持大文件的数据库工具读取。")
-    if not state["parts"]:
         return
-    with st.expander("中间分片下载（备用）", expanded=False):
-        part = st.selectbox(
-            "选择下载分片", state["parts"],
-            format_func=lambda item: f"{item['file']} · {item['rows']} 行 · {item['columns']} 列",
-            key=f"export_part_{job.directory.name}",
-        )
-        if part["notice_count"]:
-            st.warning(f"本分片有 {part['notice_count']} 条字段或工序差异提示，相关记录已保留。")
-        download_link(part, "下载分片 CSV", "text/csv")
-        if state["status"] not in ("queued", "running"):
-            download_link({"file": "manifest.json"}, "下载任务清单", "application/json")
+
+    with st.container(horizontal=True):
+        st.metric("已找到系统 LOT", f"{state.get('found_lots', state['rows']):,}", border=True)
+        st.metric("已整理数据行数", f"{state['rows']:,}", border=True)
+    if active:
+        if state.get("phase") == "joining" and state["rows"]:
+            # 查询已结束，总行数已知；这里展示 CSV 写入进度，而非整个任务的预计耗时。
+            done, total = state.get("joined_rows", 0), state["rows"]
+            st.progress(min(done / total, 1.0), text=f"生成完整 CSV · {done:,} / {total:,} 行")
+        else:
+            st.caption("每 2 秒刷新，数量随每批查询和整理结果更新。查询结束后生成完整 CSV。")
+        if st.button("取消查询", key="cancel_export", disabled=job.cancel.is_set()):
+            job.cancel.set()
+            st.rerun(scope="fragment")
 
 
 export_status()

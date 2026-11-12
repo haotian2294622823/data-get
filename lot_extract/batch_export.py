@@ -23,7 +23,7 @@ import psycopg
 from psycopg import sql
 
 from .database import BASE, Filters, database_snapshot, products, read_rows, setting
-from .final_export import join_parts, package_csv
+from .final_export import join_parts
 from .merge import merge_tables, write_wide
 from .presentation import is_system_lot
 from .schema import LOT, MATERIAL, TABLES, UPSTREAM_PREFIX, UPSTREAM_TABLES, ExportSizeError, validate_columns
@@ -186,7 +186,8 @@ def export_batches(
     state = {
         "status": "running", "product": product, "directory": str(directory.resolve()), "rows": 0, "parts": [],
         "stage": "正在连接数据库", "cache_hits": 0, "cache_misses": 0,
-        "phase": "exporting",
+        "phase": "exporting", "found_lots": 0,
+        "lot_lookup_seconds": 0.0,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "filters": {
             "lot_no": filters.lot_no, "product_field": filters.product_field, "product": filters.product,
@@ -198,7 +199,7 @@ def export_batches(
 
     def check() -> None:
         if cancel is not None and cancel.is_set():
-            raise ExportCancelled("任务已取消，已完成的分片保留。")
+            raise ExportCancelled("任务已取消，已保存的中间结果保留在服务器。")
 
     def publish(stage: str) -> None:
         state["stage"] = stage
@@ -262,6 +263,7 @@ def export_batches(
                                 "rows": len(rows), "columns": len(columns), "bytes": destination.stat().st_size,
                                 "schema_sha256": hashlib.sha256(json.dumps(columns, ensure_ascii=False).encode()).hexdigest(),
                                 "notice_count": len(notices),
+                                "notice_examples": list(dict.fromkeys(notices))[:10],
                                 "seconds": round(perf_counter() - attempt_started, 3),
                                 "read_seconds": round(read_seconds, 3),
                                 "material_seconds": round(material_seconds, 3),
@@ -270,7 +272,7 @@ def export_batches(
                             })
                             state["rows"] += len(rows)
                             state["cache_hits"], state["cache_misses"] = cache.hits, cache.misses
-                            publish(f"已完成 {len(state['parts'])} 个分片，共 {state['rows']} 个系统 LOT")
+                            publish(f"已整理 {state['rows']:,} 行数据")
                     except ExportSizeError as error:
                         if len(lots) == 1:
                             raise ExportSizeError(f"单个系统 LOT {lots[0][index]} 超出上限，不能截断记录：{error}") from error
@@ -286,9 +288,11 @@ def export_batches(
                     statement = sql.SQL(
                         "SELECT * FROM {} WHERE ({}) AND lot_no LIKE %s AND lot_no NOT LIKE %s AND lot_no > %s ORDER BY lot_no LIMIT %s"
                     ).format(sql.Identifier(schema, LOT), where)
+                    lookup_started = perf_counter()
                     with read_rows(connection, statement, [*parameters, "E%", "%E%E%", last_lot, batch_size + 1]) as (fields, records):
                         validate_columns(LOT, fields)
                         lots = list(records)
+                    state["lot_lookup_seconds"] += perf_counter() - lookup_started
                     if not lots:
                         break
                     index = fields.index("lot_no")
@@ -296,26 +300,31 @@ def export_batches(
                     if len(keys) != len(set(keys)) or any(not is_system_lot(key) for key in keys):
                         raise ValueError("批次表存在重复 LOT 或 LOT 不是仅以一个 E 开头，不能可靠分页。")
                     page = lots[:batch_size]
+                    # 只统计本页实际处理的 LOT；多取的一条用于判断下一页，
+                    # 超限后的拆批重试也不能重复累计这个数量。
+                    state["found_lots"] += len(page)
+                    publish(f"已找到 {state['found_lots']:,} 个系统 LOT，正在整理关联数据")
                     process(fields, page)
                     last_lot = page[-1][index]
                     if len(lots) <= batch_size:
                         break
             finally:
                 cache.close()
-        # 先释放数据库快照，再在本地拼接、压缩，避免文件处理延长数据库事务。
+        # 先释放数据库快照，再在本地拼接，避免文件处理延长数据库事务。
         if state["parts"]:
+            state["phase"] = "joining"
+            state["joined_rows"] = 0
+            publish("查询完成，正在准备完整 CSV")
+
             def join_progress(done: int, total: int) -> None:
-                state["phase"] = "joining"
                 state["joined_rows"] = done
-                publish(f"正在拼接最终宽表：{done}/{total} 行")
+                publish(f"正在生成完整 CSV：{done:,}/{total:,} 行")
 
+            join_started = perf_counter()
             state["final_csv"] = join_parts(directory, state["parts"], check, join_progress)
+            state["join_seconds"] = round(perf_counter() - join_started, 3)
 
-            def zip_progress(done: int, total: int) -> None:
-                state["phase"] = "packing"
-                publish(f"正在打包最终宽表：{done // 1048576}/{total // 1048576} MiB")
-
-            state["final_zip"] = package_csv(directory, state["final_csv"], check, zip_progress)
+        state["lot_lookup_seconds"] = round(state["lot_lookup_seconds"], 3)
         state["status"] = "complete"
         state["phase"] = "complete"
         publish("导出完成，已生成一份完整宽表" if state["rows"] else "没有符合条件的 E 开头系统 LOT")

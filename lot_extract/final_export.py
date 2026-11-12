@@ -1,4 +1,4 @@
-"""流式对齐分片表头，生成唯一最终 CSV 和 ZIP，不全量加载年度行数据。"""
+"""流式对齐分片表头并生成最终 CSV。"""
 
 from __future__ import annotations
 
@@ -11,12 +11,14 @@ from collections.abc import Callable
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import monotonic
-from zipfile import ZIP_DEFLATED, ZipFile
 
+from .material_rules import material_column_key
 from .presentation import is_system_lot
 
 
 def column_rank(column: str, position: int) -> tuple:
+    if key := material_column_key(column):
+        return (1, *key)
     material = re.match(r"^工序0-(.+?)_(\d+)(?:_|$)", column)
     if material:
         name, number = material.groups()
@@ -97,47 +99,10 @@ def join_parts(
             temporary.unlink(missing_ok=True)
 
 
-def package_csv(
-    directory: Path,
-    final_csv: dict,
-    check: Callable[[], None],
-    progress: Callable[[int, int], None],
-) -> dict:
-    """ZIP 中只有一份完整 CSV 和结果说明；按块压缩并支持超过 4 GiB 的文件。"""
-    destination = directory / "result.zip"
-    temporary = None
-    size = final_csv["bytes"]
-    written = 0
-    last_update = monotonic()
-    progress(0, size)
-    try:
-        with NamedTemporaryFile(dir=directory, delete=False) as stream:
-            temporary = Path(stream.name)
-        with ZipFile(temporary, "w", compression=ZIP_DEFLATED, compresslevel=1, allowZip64=True) as archive:
-            with (directory / final_csv["file"]).open("rb") as source, archive.open(
-                "final.csv", "w", force_zip64=True
-            ) as output:
-                while content := source.read(4 * 1024 * 1024):
-                    check()
-                    output.write(content)
-                    written += len(content)
-                    if monotonic() - last_update >= 1:
-                        progress(written, size)
-                        last_update = monotonic()
-            archive.writestr("export_summary.json", json.dumps(final_csv, ensure_ascii=False, indent=2))
-        check()
-        os.replace(temporary, destination)
-        progress(written, size)
-        return {"file": destination.name, "bytes": destination.stat().st_size}
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-
-
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="将已完成任务的分片拼接为一个 CSV 并打包，无需重新查询数据库。")
+    parser = argparse.ArgumentParser(description="将已完成任务的分片拼接为一个 CSV，无需重新查询数据库。")
     parser.add_argument("directory", type=Path, help="包含 manifest.json 的已完成任务目录")
     args = parser.parse_args()
     try:
@@ -146,14 +111,13 @@ if __name__ == "__main__":
         state = json.loads(manifest.read_text(encoding="utf-8"))
         if state.get("status") != "complete" or not state.get("parts"):
             raise ValueError("只支持有分片的已完成任务，不能将未完成任务标记为完整结果。")
-        if (root / "final.csv").exists() or (root / "result.zip").exists():
+        if (root / "final.csv").exists():
             raise ValueError("任务目录已有最终结果，不能覆盖。")
         for part in state["parts"]:
             if Path(part["file"]).name != part["file"]:
                 raise ValueError("清单中的分片文件名无效。")
         report = lambda done, total: print(f"{done}/{total}", flush=True)
         state["final_csv"] = join_parts(root, state["parts"], lambda: None, report)
-        state["final_zip"] = package_csv(root, state["final_csv"], lambda: None, report)
         state["progress"], state["phase"] = 1.0, "complete"
         temporary = None
         try:
@@ -164,6 +128,6 @@ if __name__ == "__main__":
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
-        print(f"完整 CSV：{root / 'final.csv'}\n结果包：{root / 'result.zip'}")
+        print(f"完整 CSV：{root / 'final.csv'}")
     except (Exception, KeyboardInterrupt) as error:
         parser.exit(1, f"拼接未完成：{error or '操作已取消'}\n")

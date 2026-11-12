@@ -1,131 +1,112 @@
-"""材料前工程的独立合并模块，不连接数据库。
-
-读取材料四表，按 process_name 分工程合并，再按原始用料关系挂接制造行。
-共享 CSV 校验和单 LOT 展开函数沿用 merge.py；材料分组、排序和关联在本模块。
-"""
+"""按原始用料关系把材料工程展开为制造宽表的工序0。"""
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 
-from .merge import Row, check_shape, label, merge_records, numeric_order, pass_text, read_tables
-from .schema import LOT, PROCESS, UPSTREAM_PREFIX, UPSTREAM_TABLES
+from .csv_io import Row, check_shape, read_tables
+from .material_rules import (
+    IDENTITY_FIELDS, NO_PROCESS, UNKNOWN, UNMATCHED, MaterialRule,
+    load_material_rules, material_column_key, material_rule,
+)
+from .schema import DEFECT, LOT, MACHINE, PROCESS, TABLES, UPSTREAM_PREFIX, UPSTREAM_TABLES, numeric_order
+
+
+ExecutionKey = tuple[str, str, tuple[int, Decimal, str]]
+
+
+@dataclass(frozen=True)
+class MaterialExecution:
+    rule: MaterialRule
+    fields: Row
 
 
 def material_usages(records: list[Row]) -> dict[str, list[str]]:
-    """按首次使用顺序列出系统 LOT 的直接材料，不用材料类别决定工程分组。"""
-    usages: dict[str, list[str]] = defaultdict(list)
-    seen: set[tuple[str, str]] = set()
-    ordered = sorted(records, key=lambda r: (
+    """按首次使用顺序收集材料，同一制造 LOT 的重复用料共用前工程。"""
+    usages: dict[str, dict[str, None]] = defaultdict(dict)
+    for row in sorted(records, key=lambda r: (
         r["lot_no"], numeric_order(r["pass_order"]), r["process_key"],
         numeric_order(r["seq"]), r["material_lot_no"],
-    ))
-    for row in ordered:
-        lot, material = row["lot_no"], row["material_lot_no"]
-        if not material.strip() or (lot, material) in seen:
+    )):
+        if row["material_lot_no"].strip():
+            usages[row["lot_no"]][row["material_lot_no"]] = None
+    return {lot: list(materials) for lot, materials in usages.items()}
+
+
+def execution_key(row: Row) -> ExecutionKey:
+    # 用精确数值比较道次，1 与 1.0 相等。输出仍保留原始字符串。
+    return row["lot_no"], row["process_key"], numeric_order(row["pass_order"])
+
+
+def execution_fields(process: Row, details: dict[str, list[Row]], rule: MaterialRule) -> Row:
+    """展开一次执行。只保留有值的可选字段，标识字段用于追溯。"""
+    fields = {field: process.get(field, "") for field in IDENTITY_FIELDS}
+    fields["material_lot_no"] = process["lot_no"]
+
+    def add(name: str, value: str) -> None:
+        if name in fields:
+            raise ValueError(f"材料工程字段名冲突：{name}")
+        fields[name] = value
+
+    for field, value in process.items():
+        if value == "" or field in ("lot_no", "process_name", "process_key", "pass_order"):
             continue
-        seen.add((lot, material))
-        usages[lot].append(material)
-    return usages
+        # 工艺表若也有同名用料字段，另存原值，材料身份始终由该行 lot_no 确定。
+        add("工艺_material_lot_no" if field == "material_lot_no" else field, value)
+
+    for source in rule.details:
+        code_field = "machine_code" if source == MACHINE else "defect_code"
+        records = sorted(details.get(source, []), key=lambda r: (numeric_order(r[code_field]), r[code_field]))
+        for number, record in enumerate(records, 1):
+            prefix = f"{TABLES[source][0]}{number}_"
+            for field, value in record.items():
+                # 关联键在本执行列组中已有对应字段，明细只补充自己的值。
+                if field not in ("lot_no", "process_key", "pass_order") and (value != "" or field == code_field):
+                    add(prefix + field, value)
+    return fields
 
 
-def engineering_order(name: str) -> tuple[int, str]:
-    """只控制展示顺序：E-Core、I-Core、卷线、其他；分组仍用完整工程名。"""
-    normalized = name.casefold()
-    for position, keyword in enumerate(("e-core", "i-core", "卷线")):
-        if keyword in normalized:
-            return position, name
-    return 3, name
+def material_executions(tables: dict[str, list[Row]]) -> tuple[dict[str, list[MaterialExecution]], list[str]]:
+    """为每个材料建立执行索引，供使用同一材料的各个制造 LOT 复用。"""
+    rules = load_material_rules()
+    parents: dict[ExecutionKey, tuple[Row, MaterialRule]] = {}
+    details: dict[ExecutionKey, dict[str, list[Row]]] = defaultdict(lambda: defaultdict(list))
+    counts: Counter[str] = Counter()
+    for process in tables[PROCESS]:
+        if not process["process_key"]:
+            raise ValueError("材料工序键为空，无法可靠区分执行记录")
+        rule = material_rule(process.get("process_name", ""), rules)
+        parents[execution_key(process)] = process, rule
+        if rule == UNKNOWN:
+            counts["未识别工程记录"] += 1
 
+    for source in (MACHINE, DEFECT):
+        for record in tables[source]:
+            key = execution_key(record)
+            if key not in parents:
+                # 道次不符和缺父工序时，将明细留在独立列组，保留原始关联键。
+                parents[key] = {field: record[field] for field in ("lot_no", "process_key", "pass_order")}, UNMATCHED
+            rule = parents[key][1]
+            if rule == UNMATCHED:
+                counts["未匹配工程明细"] += 1
+            if source in rule.details:
+                details[key][source].append(record)
 
-def merge_material_engineering(
-    headers: dict[str, list[str]],
-    tables: dict[str, list[Row]],
-    *,
-    max_columns: int | None = None,
-) -> tuple[dict[str, tuple[list[str], dict[str, Row]]], list[str]]:
-    """先按真实 process_name 分工程，再在各工程内合并每个材料 LOT。
+    by_lot: dict[str, list[MaterialExecution]] = defaultdict(list)
+    for key, (process, rule) in sorted(parents.items(), key=lambda item: (item[0][0], item[0][2], item[0][1])):
+        by_lot[key[0]].append(MaterialExecution(rule, execution_fields(process, details.get(key, {}), rule)))
 
-    同一材料 LOT 可以有多个工程，各工程只接收自己的工序和明细。
-    缺父工序或道次不符的明细单独保留，不能根据材料类别猜测归属。
-    输入须已通过 read_tables 校验并补齐缺失的材料批次占位行。
-    """
-    grouped: dict[str, dict[str, list[Row]]] = {}
-    members: dict[str, set[str]] = defaultdict(set)
-    parents = {(row["lot_no"], row["process_key"]): row for row in tables[PROCESS]}
-
-    def add(name: str, source: str, row: Row) -> None:
-        if name not in grouped:
-            grouped[name] = {table: [] for table in tables}
-        grouped[name][source].append(row)
-        members[name].add(row["lot_no"])
-
-    for row in tables[PROCESS]:
-        add(row.get("process_name", "").strip() or "未提供工程", PROCESS, row)
-    for source in tables:
-        if source in (LOT, PROCESS):
-            continue
-        for row in tables[source]:
-            parent = parents.get((row["lot_no"], row["process_key"]))
-            matched = parent is not None and pass_text(parent["pass_order"]) == pass_text(row["pass_order"])
-            name = (parent.get("process_name", "").strip() or "未提供工程") if matched else "未匹配工程"
-            add(name, source, row)
-
-    lot_names: dict[str, list[str]] = defaultdict(list)
-    for name, lots in members.items():
-        for lot in lots:
-            lot_names[lot].append(name)
     for row in tables[LOT]:
-        names = lot_names.get(row["lot_no"], []) or ["未提供工程"]
-        for name in names:
-            add(name, LOT, row)
+        if row["lot_no"] not in by_lot:
+            fields = execution_fields({"lot_no": row["lot_no"]}, {}, NO_PROCESS)
+            by_lot[row["lot_no"]].append(MaterialExecution(NO_PROCESS, fields))
+            counts["没有工程记录的材料 LOT"] += 1
 
-    result = {}
-    notices = []
-    for name in sorted(grouped, key=engineering_order):
-        columns, rows, messages = merge_records(
-            headers, grouped[name], max_columns=max_columns, flat_details=True
-        )
-        result[name] = columns, {row["lot_no"]: row for row in rows}
-        notices.extend(f"材料工程 {name}：{message}" for message in messages)
-    return result, notices
-
-
-def attach_material_engineering(
-    columns: list[str],
-    rows: list[Row],
-    usages: dict[str, list[str]],
-    engineering: dict[str, tuple[list[str], dict[str, Row]]],
-    *,
-    max_columns: int | None = None,
-    max_cells: int | None = None,
-) -> list[str]:
-    """按原始材料 LOT 关联制造行；工程排序不改变 LOT 归属或合计数量。"""
-    primary = set(columns)
-    added: dict[str, tuple[int, int, int]] = {}
-    for engineering_index, name in enumerate(sorted(engineering, key=engineering_order)):
-        fields, materials = engineering[name]
-        for row in rows:
-            position = 0
-            for material in usages.get(row["lot_no"], []):
-                source = materials.get(material)
-                if source is None:
-                    continue
-                position += 1
-                prefix = f"工序0-{label(name)}_{position}_"
-                for field_index, field in enumerate(fields):
-                    if field not in source:
-                        continue
-                    # 材料组自身也带真实 LOT，便于核对同工程的多个材料和共享材料。
-                    column = prefix + ("material_lot_no" if field == "lot_no" else field)
-                    if column in primary or column in row:
-                        raise ValueError(f"前工程列名冲突：{column}")
-                    if column not in added:
-                        check_shape(len(columns) + len(added) + 1, len(rows), max_columns, max_cells)
-                        added[column] = (engineering_index, position, field_index)
-                    row[column] = source[field]
-    return [*columns, *sorted(added, key=added.__getitem__)]
+    notices = [f"前工程有 {count} 条{reason}，已保留在对应列组" for reason, count in counts.items()]
+    return by_lot, notices
 
 
 def merge_and_attach_materials(
@@ -137,18 +118,51 @@ def merge_and_attach_materials(
     max_columns: int | None = None,
     max_cells: int | None = None,
 ) -> tuple[list[str], list[str]]:
-    """材料模块入口：读材料存档、核对用料范围、分工程合并并挂接制造结果。"""
     usages = material_usages(records)
-    headers, tables = read_tables(base, UPSTREAM_TABLES, UPSTREAM_PREFIX)
-    requested = {material for materials in usages.values() for material in materials}
-    present = {row["lot_no"] for row in tables[LOT]}
-    details = {row["lot_no"] for table in UPSTREAM_TABLES[1:] for row in tables[table]}
-    if (present | details) - requested:
+    _, tables = read_tables(base, UPSTREAM_TABLES, UPSTREAM_PREFIX, pass_order_key=numeric_order)
+    requested = {lot for materials in usages.values() for lot in materials}
+    if any(record["lot_no"] not in requested for table in tables.values() for record in table):
         raise ValueError("前工程 CSV 包含用料关系中不存在的 LOT，请核对查询目录。")
-    for lot in sorted(details - present):
-        tables[LOT].append({field: lot if field == "lot_no" else "" for field in headers[LOT]})
-    engineering, notices = merge_material_engineering(headers, tables, max_columns=max_columns)
-    columns = attach_material_engineering(
-        columns, rows, usages, engineering, max_columns=max_columns, max_cells=max_cells
-    )
-    return columns, notices
+    executions, notices = material_executions(tables)
+    missing = requested - executions.keys()
+    if missing:
+        notices.append(f"有 {len(missing)} 个材料 LOT 未查到前工程数据，制造用料列保留原编号")
+
+    primary = set(columns)
+    added: set[str] = set()
+    repeated: set[tuple[str, str]] = set()
+    for row in rows:
+        positions: Counter[str] = Counter()
+        for lot in usages.get(row["lot_no"], ()):
+            # 卷线按材料计数，额外执行留在该材料组内。执行计数型工程每次开新列组。
+            material_positions: dict[str, int] = {}
+            execution_numbers: Counter[str] = Counter()
+            for event in executions.get(lot, ()):
+                name = event.rule.name
+                if event.rule.number_by == "material_lot":
+                    if name not in material_positions:
+                        positions[name] += 1
+                        material_positions[name] = positions[name]
+                    position = material_positions[name]
+                    execution_numbers[name] += 1
+                    number = execution_numbers[name]
+                else:
+                    positions[name] += 1
+                    position, number = positions[name], 1
+
+                prefix = f"工序0_{name}{position}_"
+                if number > 1:
+                    prefix += f"执行{number}_"
+                    repeated.add((name, lot))
+                for field, value in event.fields.items():
+                    column = prefix + field
+                    if column in primary or column in row:
+                        raise ValueError(f"前工程列名冲突：{column}")
+                    if column not in added:
+                        check_shape(len(columns) + len(added) + 1, len(rows), max_columns, max_cells)
+                        added.add(column)
+                    row[column] = value
+
+    for name, count in sorted(Counter(name for name, _ in repeated).items()):
+        notices.append(f"{name}有 {count} 个材料 LOT 出现多次执行，已保留在同一材料列组")
+    return [*columns, *sorted(added, key=material_column_key)], notices
