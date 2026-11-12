@@ -5,9 +5,24 @@
 ## 项目文件
 
 - `app.py` 启动页面，`ui.py` 负责操作界面。
-- `lot_extract/` 存放取数、合并和导出逻辑，`tests/` 存放可离线运行的回归测试。
-- `export_batches.py`、`get_bylot.py`、`merge_csv.py` 是下面列出的命令行入口。
+- `cli.py` 统一提供批量导出、单 LOT 取数、离线合并、最终拼接和 CSV 筛选命令。
+- `lot_extract/` 存放业务代码，`tests/` 保留离线回归用例。
 - [当前开发文档](docs/制造数据条件抽取系统_开发文档_V0.4.md)和[可视化导入计划表](docs/reference/可视化导入计划表.xlsx)位于 `docs/`。
+
+业务代码按下面的顺序阅读：
+
+| 文件 | 负责什么 |
+|---|---|
+| `lot_extract/database.py` | 产品配置、查询条件、数据库读取和单次原始存档 |
+| `lot_extract/tables.py` | 原始表结构、LOT 规则、CSV 校验和读写 |
+| `lot_extract/merge.py` | 制造工程展开、材料挂接和离线合并 |
+| `lot_extract/material_merge.py` | 材料规则加载及工序0展开 |
+| `lot_extract/batch_export.py` | 分页取数、材料缓存、批量导出流程 |
+| `lot_extract/final_export.py` | 按列对齐，生成最终 CSV |
+| `lot_extract/jobs.py` | 后台任务、进度快照和取消 |
+| `lot_extract/downloads.py` | 下载凭证与文件传输 |
+
+页面主流程是 `ui.py → jobs.py → batch_export.py`。修改制造展开看 `merge.py`，修改材料展开看 `material_merge.py`，工程别名和展示选项改 `material_rules.json`。
 
 ## 启动
 
@@ -39,7 +54,7 @@ ABC_DB_TIMEZONE=Asia/Shanghai
 
 页面查询在后台按完整系统 LOT 分批处理，保存到 `outputs/queries/<产品>/batch_<任务编号>/`。可用 `EXPORT_DIR` 指定存档根目录。完成后自动按列名对齐，拼接为一份 `final.csv`。`part_*.csv` 只作为中间分片，`archives/part_*/` 保存对应的七张系统原始表和四张 `upstream_*.csv`。任务的 `manifest.json` 记录行数、列数、各阶段耗时、缓存命中及表头指纹。空表保留表头。
 
-`lot_extract/merge.py` 是宽表合并入口。`manufacturing_merge.py` 展开制造工程，`material_merge.py` 按制造用料 `material_lot_no` 找到前工程的 `lot_no`，把匹配到的材料工程接到同一行。每个制造 LOT 一行。
+`lot_extract/merge.py` 负责制造工程展开和整体合并；`material_merge.py` 按制造用料 `material_lot_no` 找到前工程的 `lot_no`，把匹配到的材料工程接到同一行。每个制造 LOT 一行。
 
 输出按「制造批次信息 → 工序0材料工程 → 工序1及后续制造工程」排列。
 
@@ -47,7 +62,7 @@ ABC_DB_TIMEZONE=Asia/Shanghai
 
 卷线按材料 LOT、工序键和道次关联设备及不良，例如 `工序0_卷线1_机台设备1_machine_name` 和 `工序0_卷线1_不良1_defect_qty`。不良名称和数量各自占一列。工序0保留关联字段与有值的可选字段，`0` 是有效值。原始存档可用于核对材料批次属性和各工程的完整明细。
 
-数据库查询和最终导出仅保留顶层系统 `lot_no` 以大写 `E` 开头、且整个编号仅含一个大写 `E` 的行。例如 `E6X08010` 保留，`EE6X08010`、`E6XE8010` 排除。材料 LOT 不套用此规则、系统日期或品番条件。旧存档的最终筛选仍可由独立的 `lot_extract/presentation.py` 完成。批处理没有符合条件的 LOT 时记录零行任务，不生成空分片。
+数据库查询和最终导出仅保留顶层系统 `lot_no` 以大写 `E` 开头、且整个编号仅含一个大写 `E` 的行。例如 `E6X08010` 保留，`EE6X08010`、`E6XE8010` 排除。材料 LOT 不套用此规则、系统日期或品番条件。旧存档可通过 `python cli.py filter` 应用同一规则。批处理没有符合条件的 LOT 时记录零行任务，不生成空分片。
 
 页面每两秒刷新查询状态，显示已找到系统 LOT 数和已整理行数，数量随批次处理递增。查询阶段总数未知，使用动态状态提示，不额外执行全年 LOT 总数查询；取数结束后，按实际写入行数显示完整 CSV 的生成进度条。任务运行期间可取消。
 
@@ -62,18 +77,18 @@ ABC_DB_TIMEZONE=Asia/Shanghai
 ## 手动工具
 
 ```powershell
-python export_batches.py --start 2026-01-01 --end 2026-12-31 --product DFEC --batch-size 500
-python -m lot_extract.final_export "outputs/queries/DFEC/已完成的分批任务目录"
-python get_bylot.py LOT123 --product DFEC
-python merge_csv.py "outputs/queries/DFEC/查询编号" --output "outputs/宽表.csv"
-python -m lot_extract.presentation "已有合并表.csv" --output "仅E批次.csv"
+python cli.py export --start 2026-01-01 --end 2026-12-31 --product DFEC --batch-size 500
+python cli.py fetch LOT123 --product DFEC
+python cli.py merge "outputs/queries/DFEC/查询编号" --output "outputs/宽表.csv"
+python cli.py join "outputs/queries/DFEC/已完成的分批任务目录"
+python cli.py filter "已有合并表.csv" --output "仅E批次.csv"
 ```
 
-`get_bylot.py` 单独运行时只取数和存档。省略 LOT 参数会提示输入。 `merge_csv.py` 单独运行时读取指定目录的原始 CSV，沿用系统的合并规则。页面和两个手动入口共用 `lot_extract/` 内的业务代码。
+原来的三个命令行脚本已合并到 `cli.py`。`fetch` 只取数和存档，省略 LOT 参数时提示输入；`merge` 读取原始 CSV 并沿用页面的合并规则。所有入口共用 `lot_extract/` 内的业务代码。运行 `python cli.py --help` 或 `python cli.py <命令> --help` 查看参数；帮助和离线命令不加载数据库驱动。
 
-`presentation.py` 也能独立筛选已有最终 CSV；不传 `--output` 时生成同目录的 `*_E_only.csv`，禁止覆盖输入文件。
+`filter` 独立筛选已有最终 CSV；不传 `--output` 时生成同目录的 `*_E_only.csv`，禁止覆盖输入文件。
 
-`final_export.py` 的独立入口可以拼接此前已完成、只有分片的任务，不重新查询数据库。要求清单状态为完成，且目录尚无 `final.csv`，不会覆盖已有最终文件。
+`join` 可以拼接此前已完成、只有分片的任务，不重新查询数据库。要求清单状态为完成，且目录尚无 `final.csv`，不会覆盖已有最终文件。
 
 ## 年度任务注意事项
 
@@ -81,4 +96,4 @@ python -m lot_extract.presentation "已有合并表.csv" --output "仅E批次.cs
 
 长时间快照可能推迟 PostgreSQL 旧版本回收。年度导出建议连接报表库或只读副本，并由数据库管理员核对 `lot_no`、日期及品番索引。程序仍保留单条语句超时；本地验证不代表生产库全年导出性能验收。
 
-取消或失败不会删除已完成分片及其原始存档。完整 CSV 写完后发布。可以用 `merge_csv.py` 重做已完成分片；当前版本不支持服务重启后恢复旧数据库快照，也不自动续查未完成部分。重新查询会创建新任务目录。
+取消或失败不会删除已完成分片及其原始存档。完整 CSV 写完后发布。可以用 `cli.py merge` 重做已完成分片；当前版本不支持服务重启后恢复旧数据库快照，也不自动续查未完成部分。重新查询会创建新任务目录。

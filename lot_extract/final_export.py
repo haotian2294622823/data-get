@@ -12,8 +12,8 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import monotonic
 
-from .material_rules import material_column_key
-from .presentation import is_system_lot
+from .material_merge import material_column_key
+from .tables import is_system_lot
 
 
 def column_rank(column: str, position: int) -> tuple:
@@ -99,35 +99,28 @@ def join_parts(
             temporary.unlink(missing_ok=True)
 
 
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="将已完成任务的分片拼接为一个 CSV，无需重新查询数据库。")
-    parser.add_argument("directory", type=Path, help="包含 manifest.json 的已完成任务目录")
-    args = parser.parse_args()
+def join_saved_export(directory: Path) -> Path:
+    """离线拼接一个已完成的存档任务；已有完整结果时拒绝覆盖。"""
+    root = Path(directory)
+    manifest = root / "manifest.json"
+    state = json.loads(manifest.read_text(encoding="utf-8"))
+    if state.get("status") != "complete" or not state.get("parts"):
+        raise ValueError("只支持有分片的已完成任务，不能将未完成任务标记为完整结果。")
+    if (root / "final.csv").exists():
+        raise ValueError("任务目录已有最终结果，不能覆盖。")
+    for part in state["parts"]:
+        if Path(part["file"]).name != part["file"]:
+            raise ValueError("清单中的分片文件名无效。")
+    report = lambda done, total: print(f"{done}/{total}", flush=True)
+    state["final_csv"] = join_parts(root, state["parts"], lambda: None, report)
+    state["progress"], state["phase"] = 1.0, "complete"
+    temporary = None
     try:
-        root = args.directory
-        manifest = root / "manifest.json"
-        state = json.loads(manifest.read_text(encoding="utf-8"))
-        if state.get("status") != "complete" or not state.get("parts"):
-            raise ValueError("只支持有分片的已完成任务，不能将未完成任务标记为完整结果。")
-        if (root / "final.csv").exists():
-            raise ValueError("任务目录已有最终结果，不能覆盖。")
-        for part in state["parts"]:
-            if Path(part["file"]).name != part["file"]:
-                raise ValueError("清单中的分片文件名无效。")
-        report = lambda done, total: print(f"{done}/{total}", flush=True)
-        state["final_csv"] = join_parts(root, state["parts"], lambda: None, report)
-        state["progress"], state["phase"] = 1.0, "complete"
-        temporary = None
-        try:
-            with NamedTemporaryFile(mode="w", encoding="utf-8", dir=root, delete=False) as output:
-                temporary = Path(output.name)
-                json.dump(state, output, ensure_ascii=False, indent=2)
-            os.replace(temporary, manifest)
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
-        print(f"完整 CSV：{root / 'final.csv'}")
-    except (Exception, KeyboardInterrupt) as error:
-        parser.exit(1, f"拼接未完成：{error or '操作已取消'}\n")
+        with NamedTemporaryFile(mode="w", encoding="utf-8", dir=root, delete=False) as output:
+            temporary = Path(output.name)
+            json.dump(state, output, ensure_ascii=False, indent=2)
+        os.replace(temporary, manifest)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return root / "final.csv"

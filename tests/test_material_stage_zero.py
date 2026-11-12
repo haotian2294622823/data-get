@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 
 from lot_extract.final_export import column_rank, join_parts
 from lot_extract.merge import merge_tables, write_wide
-from lot_extract.schema import DEFECT, LOT, MACHINE, MATERIAL, PROCESS, TABLES, UPSTREAM_PREFIX, UPSTREAM_TABLES
+from lot_extract.tables import DEFECT, LOT, MACHINE, MATERIAL, PROCESS, TABLES, UPSTREAM_PREFIX, UPSTREAM_TABLES
 
 
 EXTRA = {
