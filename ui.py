@@ -120,7 +120,18 @@ def export_status() -> None:
         st.caption("每行对应一个系统 LOT，行数不包含表头。")
         notices = sum(part.get("notice_count", 0) for part in state["parts"])
         if notices:
-            st.warning(f"本次导出有 {notices:,} 条字段或工序差异提示，相关记录已保留在完整结果中。")
+            st.warning(
+                f"本次导出有 {notices:,} 条字段或工序差异提示，相关记录已保留在完整结果中。",
+                icon="⚠️",
+            )
+            # 分片清单里保存去重后的提示原文，这里跨分片合并后逐条展示。
+            examples = list(dict.fromkeys(
+                text for part in state["parts"] for text in part.get("notice_examples", [])
+            ))
+            if examples:
+                with st.expander("查看提示明细"):
+                    for text in examples:
+                        st.markdown(f"- {text}")
         if final_csv.get("exceeds_excel_columns") or final_csv.get("exceeds_excel_rows"):
             st.warning("完整 CSV 超过 Excel 单工作表的行或列限制。数据未截断，请使用支持大文件的数据库工具读取。")
 

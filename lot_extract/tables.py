@@ -84,6 +84,18 @@ def pass_text(value: str) -> str:
     return (text or "未提供") if invalid else format(number.normalize(), "f")
 
 
+def label(value: str) -> str:
+    """转义拼接进列名的动态片段，避免原文的下划线被误认作层级分隔符。"""
+    # 先转义百分号，确保原文中的 %5F 与由下划线转义得到的 %5F 不会混淆。
+    # 只处理列名片段，源单元格内容不作替换。
+    return (
+        value.replace("%", "%25")
+        .replace("_", "%5F")
+        .replace("\n", "%0A")
+        .replace("\r", "%0D")
+    )
+
+
 # CSV 中所有值保留为字符串，避免 LOT 前导零、编号格式和原始小数表示被改写。
 Row = dict[str, str]
 # 仅用于判断 Excel 公式样式文本是否其实是合法数字，不参与数值汇总。

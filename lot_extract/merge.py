@@ -10,7 +10,7 @@ from tempfile import NamedTemporaryFile
 from .material_merge import merge_and_attach_materials
 from .tables import (
     DEFECT, LOT, MACHINE, MATERIAL, PROCESS, TABLES, UPSTREAM_PREFIX, UPSTREAM_TABLES,
-    Row, check_shape, filter_final_rows, numeric_order, pass_text, read_tables,
+    Row, check_shape, filter_final_rows, label, numeric_order, pass_text, read_tables,
     write_wide as write_wide,
 )
 
@@ -66,18 +66,6 @@ PROCESS_FIELDS = {
     "actual_start_datetime",
     "actual_finish_datetime",
 }
-
-
-def label(value: str) -> str:
-    """转义拼接进列名的动态片段，避免原文的下划线被误认作层级分隔符。"""
-    # 先转义百分号，确保原文中的 %5F 与由下划线转义得到的 %5F 不会混淆。
-    # 只处理列名片段，源单元格内容不作替换。
-    return (
-        value.replace("%", "%25")
-        .replace("_", "%5F")
-        .replace("\n", "%0A")
-        .replace("\r", "%0D")
-    )
 
 
 def merge_records(

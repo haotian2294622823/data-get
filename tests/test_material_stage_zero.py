@@ -38,7 +38,7 @@ def machine(lot, key, name, order='1.0'):
 
 
 def defect(lot, key, name):
-    return dict(lot_no=lot, process_key=key, pass_order='1', defect_code='01', defect_name=name, defect_qty='2')
+    return dict(lot_no=lot, process_key=key, pass_order='1', defect_code=f'D{name}', defect_name=name, defect_qty='2')
 
 
 def fixture(path, usages, processes, *, equipment=(), defects=(), missing_lots=()):
@@ -81,8 +81,8 @@ class MaterialStageZeroTests(unittest.TestCase):
             prefix = f'工序0_卷线{number}_'
             self.assertEqual(first.get(prefix + 'material_lot_no'), lot)
             self.assertEqual(first[prefix + '机台设备1_machine_name'], device)
-            self.assertEqual(first[prefix + '不良1_defect_name'], flaw)
-            self.assertEqual(first[prefix + '不良1_defect_qty'], '2')
+            self.assertEqual(first[prefix + f'不良_{flaw}'], '2')
+            self.assertEqual(first[prefix + f'不良_{flaw}_代码'], f'D{flaw}')
         self.assertNotIn('工序0_卷线2_material_lot_no', second)
         self.assertFalse(any(c.startswith('工序0_卷线3_') for c in columns))
         self.assertEqual(first['工序0_E-Core2_process_key'], 'E2')

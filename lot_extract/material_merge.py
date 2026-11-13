@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from functools import lru_cache
@@ -12,7 +13,7 @@ from pathlib import Path
 
 from .tables import (
     DEFECT, LOT, MACHINE, PROCESS, TABLES, UPSTREAM_PREFIX, UPSTREAM_TABLES,
-    Row, check_shape, numeric_order, read_tables,
+    Row, check_shape, label, numeric_order, read_tables,
 )
 
 
@@ -20,7 +21,9 @@ DETAIL_TABLES = {"machine": MACHINE, "defect": DEFECT}
 IDENTITY_FIELDS = ("material_lot_no", "process_name", "process_key", "pass_order")
 COLUMN_PATTERN = re.compile(r"^工序0_([^_]+?)([0-9]+)_(.+)$", re.DOTALL)
 EXECUTION_PATTERN = re.compile(r"^执行([0-9]+)_(.+)$", re.DOTALL)
-DETAIL_PATTERN = re.compile(r"^(机台设备|不良)([0-9]+)_(.+)$", re.DOTALL)
+# 机台设备仍按“机台设备1”“机台设备2”编号；不良改用名称做列名，只保留“不良_名称”前缀。
+MACHINE_DETAIL_PATTERN = re.compile(r"^机台设备([0-9]+)_(.+)$", re.DOTALL)
+DEFECT_DETAIL_PATTERN = re.compile(r"^不良_(.+)$", re.DOTALL)
 
 
 @dataclass(frozen=True)
@@ -99,9 +102,10 @@ def material_column_key(column: str) -> tuple | None:
     field = execution[2] if execution else field
     if field in IDENTITY_FIELDS:
         field_key = (0, IDENTITY_FIELDS.index(field), field)
-    elif detail := DETAIL_PATTERN.fullmatch(field):
-        source = 2 if detail[1] == TABLES[MACHINE][0] else 3
-        field_key = (source, int(detail[2]), detail[3])
+    elif machine := MACHINE_DETAIL_PATTERN.fullmatch(field):
+        field_key = (2, int(machine[1]), machine[2])
+    elif defect := DEFECT_DETAIL_PATTERN.fullmatch(field):
+        field_key = (3, 0, defect[1])
     else:
         field_key = (1, 0, field)
     return order, name, int(number), execution_number, *field_key
@@ -133,8 +137,41 @@ def execution_key(row: Row) -> ExecutionKey:
     return row["lot_no"], row["process_key"], numeric_order(row["pass_order"])
 
 
-def execution_fields(process: Row, details: dict[str, list[Row]], rule: MaterialRule) -> Row:
-    """展开一次执行。只保留有值的可选字段，标识字段用于追溯。"""
+def defect_naming(records: list[Row]) -> tuple[Callable[[str, str], str], bool]:
+    """不良名称适合做列名，但同名不同码或同码不同名时退回代码，避免歧义。
+
+    与制造工程一致：名称唯一时直接用名称做列名，名称有歧义时补上代码区分。
+    """
+    name_codes: dict[str, set[str]] = defaultdict(set)
+    code_names: dict[str, set[str]] = defaultdict(set)
+    for row in records:
+        name_codes[row["defect_name"]].add(row["defect_code"])
+        code_names[row["defect_code"]].add(row["defect_name"])
+    keep_name = any(
+        not name or len(code_names[code]) > 1
+        for name, codes in name_codes.items()
+        for code in codes
+    )
+
+    def title(code: str, defect_name: str) -> str:
+        if defect_name and len(code_names[code]) == 1:
+            text = label(defect_name)
+        else:
+            text = "代码" + label(code)
+        if defect_name and len(name_codes[defect_name]) > 1 and len(code_names[code]) == 1:
+            text += "_代码" + label(code)
+        return text
+
+    return title, keep_name
+
+
+def execution_fields(
+    process: Row,
+    details: dict[str, list[Row]],
+    rule: MaterialRule,
+    naming: tuple[Callable[[str, str], str], bool],
+) -> Row:
+    """展开一次执行。不良以种类做列名，数量写在列下，代码另起子列。"""
     fields = {field: process.get(field, "") for field in IDENTITY_FIELDS}
     fields["material_lot_no"] = process["lot_no"]
 
@@ -152,6 +189,34 @@ def execution_fields(process: Row, details: dict[str, list[Row]], rule: Material
     for source in rule.details:
         code_field = "machine_code" if source == MACHINE else "defect_code"
         records = sorted(details.get(source, []), key=lambda r: (numeric_order(r[code_field]), r[code_field]))
+        if source == DEFECT:
+            title_of, keep_name = naming
+            repeats: Counter[str] = Counter()
+            for record in records:
+                code, defect_name = record["defect_code"], record["defect_name"]
+                if not code:
+                    raise ValueError("不良代码为空，无法确定项目身份")
+                title = title_of(code, defect_name)
+                repeats[title] += 1
+                position = repeats[title]
+                detail = "不良_" + title + (f"_记录{position}" if position > 1 else "")
+                # 同一种不良若出现多次，用“记录2”等后缀区分，不累计数量。
+                for field, value in record.items():
+                    if field in ("lot_no", "process_key", "pass_order", "defect_qty"):
+                        continue
+                    if field == "defect_name":
+                        if not keep_name:
+                            continue
+                        suffix = field
+                    elif field == "defect_code":
+                        suffix = "代码"
+                    else:
+                        if value == "":
+                            continue
+                        suffix = field
+                    add(f"{detail}_{suffix}", value)
+                add(detail, record.get("defect_qty", ""))
+            continue
         for number, record in enumerate(records, 1):
             prefix = f"{TABLES[source][0]}{number}_"
             for field, value in record.items():
@@ -188,12 +253,13 @@ def material_executions(tables: dict[str, list[Row]]) -> tuple[dict[str, list[Ma
                 details[key][source].append(record)
 
     by_lot: dict[str, list[MaterialExecution]] = defaultdict(list)
+    naming = defect_naming(tables[DEFECT])
     for key, (process, rule) in sorted(parents.items(), key=lambda item: (item[0][0], item[0][2], item[0][1])):
-        by_lot[key[0]].append(MaterialExecution(rule, execution_fields(process, details.get(key, {}), rule)))
+        by_lot[key[0]].append(MaterialExecution(rule, execution_fields(process, details.get(key, {}), rule, naming)))
 
     for row in tables[LOT]:
         if row["lot_no"] not in by_lot:
-            fields = execution_fields({"lot_no": row["lot_no"]}, {}, NO_PROCESS)
+            fields = execution_fields({"lot_no": row["lot_no"]}, {}, NO_PROCESS, naming)
             by_lot[row["lot_no"]].append(MaterialExecution(NO_PROCESS, fields))
             counts["没有工程记录的材料 LOT"] += 1
 
