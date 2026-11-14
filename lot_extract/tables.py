@@ -7,6 +7,7 @@ import csv
 import os
 import re
 from collections.abc import Callable, Hashable, Iterable
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from pathlib import Path
@@ -14,6 +15,111 @@ from tempfile import NamedTemporaryFile
 
 
 PRODUCT_FIELDS = ("murata_type", "toko_type")
+BASE = Path(__file__).resolve().parents[1]
+PROFILE_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,31}")
+BATCH_FIELDS = {"lot_no", "seiku", "murata_type", "toko_type", "lot_flag"}
+PROCESS_FIELDS = {"process_key", "pass_order", "actual_start_datetime", "actual_finish_datetime"}
+QUANTITY_FIELDS = {"defect_qty", "input_qty", "output_qty"}
+# PostgreSQL 的 btrim 默认只去空格，显式共用 Python strip 的空白字符范围。
+LOT_WHITESPACE = (
+    "\t\n\v\f\r\x1c\x1d\x1e\x1f \x85\xa0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000"
+)
+
+
+def load_settings() -> None:
+    """从项目目录加载 .env，保留已有环境变量。"""
+    from dotenv import load_dotenv
+
+    load_dotenv(BASE / ".env", interpolate=False)
+
+
+@dataclass(frozen=True)
+class LotPolicy:
+    """一次任务共用的系统 LOT 规则，不限制用料关系中的材料 LOT。
+
+    frozen=True 阻止规则在取数后被修改，保证 SQL 筛选与离线校验口径一致。
+    prefix 是区分大小写的字面前缀；只有单独的 * 表示不限前缀。
+    """
+
+    prefix: str = "E"
+    once: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.prefix, str) or not self.prefix.strip() or "\0" in self.prefix:
+            raise ValueError("LOT 前缀须为非空文本，使用 * 表示不限前缀。")
+        if type(self.once) is not bool:
+            raise ValueError("LOT 前缀单次出现开关须为布尔值。")
+
+    def matches(self, lot_no: str) -> bool:
+        return bool(lot_no.strip(LOT_WHITESPACE)) and (
+            self.prefix == "*" or (
+                lot_no.startswith(self.prefix) and (not self.once or lot_no.count(self.prefix) == 1)
+            )
+        )
+
+    def matches_csv(self, lot_no: str) -> bool:
+        # 宽表写出时会为公式样式的 LOT 添加单引号。校验时识别这种表示，写回仍保留转义。
+        if self.matches(lot_no):
+            return True
+        if lot_no.startswith("'") and spreadsheet_text(lot_no[1:]) == lot_no:
+            return self.matches(lot_no[1:])
+        return False
+
+
+def load_lot_policy(product: str) -> LotPolicy:
+    if not PROFILE_CODE.fullmatch(product):
+        raise ValueError("产品代码格式无效。")
+    prefix = os.getenv(f"{product}_LOT_PREFIX", "E" if product == "DFEC" else "")
+    once = os.getenv(f"{product}_LOT_PREFIX_ONCE", "1" if product == "DFEC" else "0").strip()
+    if not prefix:
+        raise ValueError(f"请配置 {product}_LOT_PREFIX。")
+    if once not in ("0", "1"):
+        raise ValueError(f"{product}_LOT_PREFIX_ONCE 须为 0 或 1。")
+    return LotPolicy(prefix, once == "1")
+
+
+def clean_qty(value: str) -> str:
+    """只去掉普通十进制数量的小数尾零，不经过舍入。
+
+    例如 85.000 -> 85、85.500 -> 85.5。调用方只对 QUANTITY_FIELDS 使用，
+    LOT、设备代码等标识不能套用此函数，否则可能改变原始编号。
+    """
+    if re.fullmatch(r"[+-]?[0-9]+\.[0-9]+", value):
+        return value.rstrip("0").rstrip(".")
+    return value
+
+
+def note_inheritance(evidence: dict[str, str | None], column: str, parent: str | None) -> None:
+    """累计一列的父子比较结果，供整个导出任务结束后统一决定是否省略。
+
+    无键表示尚未比较；字符串表示目前可由该父列还原；None 表示必须保留。
+    一次不一致就永久变为 None，后续相等的记录不能把它重新变成可省略。
+    只比较实际存在的记录，某个 LOT 根本没有该设备时不作为空值差异。
+    """
+    if evidence.setdefault(column, parent) != parent:
+        evidence[column] = None
+
+
+def inherited_columns(columns: Iterable[str], evidence: dict[str, str | None]) -> dict[str, str]:
+    """返回可省略列到最终保留父列的映射，处理多层继承。
+
+    例如“设备 seiku -> 工序 seiku -> 批次 seiku”，最终直接指向批次列，
+    避免清单引用一个同样被省略的中间列。遇到循环或缺失父列就停止追溯。
+    """
+    available = set(columns)
+    result = {}
+    for column, parent in evidence.items():
+        seen = {column}
+        while parent in available and parent not in seen:
+            ancestor = evidence.get(parent)
+            if ancestor is None or ancestor not in available:
+                result[column] = parent
+                break
+            seen.add(parent)
+            parent = ancestor
+    return result
 
 LOT = "prass_lot"
 PROCESS = "prass_lot_process"
@@ -81,7 +187,9 @@ def numeric_order(value: str) -> tuple[int, Decimal, str]:
 def pass_text(value: str) -> str:
     """统一道次的比较和列名前缀：1、1.0 视为同一道次，空值显示为“未提供”。"""
     invalid, number, text = numeric_order(value)
-    return (text or "未提供") if invalid else format(number.normalize(), "f")
+    if invalid:
+        return text or "未提供"
+    return "0" if number == 0 else clean_qty(format(number, "f"))
 
 
 def label(value: str) -> str:
@@ -204,20 +312,21 @@ class BoundedCsv:
         self.write_bytes(text.encode("utf-8"))
 
 
-def is_system_lot(lot_no: str) -> bool:
+def is_system_lot(lot_no: str, policy: LotPolicy = LotPolicy()) -> bool:
     """仅检查系统 LOT；不对材料 LOT 应用此条件。"""
-    return lot_no.startswith("E") and lot_no.count("E") == 1
+    return policy.matches(lot_no)
 
 
-def filter_final_rows(rows: Iterable[dict[str, str]]) -> list[dict[str, str]]:
+def filter_final_rows(rows: Iterable[dict[str, str]], policy: LotPolicy = LotPolicy()) -> list[dict[str, str]]:
     """只检查顶层系统 LOT；该行的材料 LOT 和所有单元格保持不变。"""
-    return [row for row in rows if is_system_lot(row["lot_no"])]
+    return [row for row in rows if policy.matches(row["lot_no"])]
 
 
-def filter_csv(source: str | Path, output: str | Path | None = None) -> Path:
+def filter_csv(source: str | Path, output: str | Path | None = None, *, policy: LotPolicy = LotPolicy()) -> Path:
     """筛选已有最终 CSV，保留表头及列顺序，写新文件而不覆盖输入文件。"""
     source = Path(source)
-    destination = Path(output) if output is not None else source.with_name(source.stem + "_E_only.csv")
+    suffix = "_E_only.csv" if policy == LotPolicy() else "_system_only.csv"
+    destination = Path(output) if output is not None else source.with_name(source.stem + suffix)
     if destination.resolve() == source.resolve() or (
         destination.exists() and source.exists() and os.path.samefile(source, destination)
     ):
@@ -241,7 +350,7 @@ def filter_csv(source: str | Path, output: str | Path | None = None) -> Path:
                 for row in reader:
                     if None in row or any(value is None for value in row.values()):
                         raise ValueError("输入 CSV 行与表头不一致。")
-                    if is_system_lot(row["lot_no"]):
+                    if policy.matches_csv(row["lot_no"]):
                         writer.writerow(row)
                         kept += 1
                     else:

@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter, defaultdict
-from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from functools import lru_cache
@@ -13,7 +12,8 @@ from pathlib import Path
 
 from .tables import (
     DEFECT, LOT, MACHINE, PROCESS, TABLES, UPSTREAM_PREFIX, UPSTREAM_TABLES,
-    Row, check_shape, label, numeric_order, read_tables,
+    BATCH_FIELDS, PROCESS_FIELDS, PROFILE_CODE, QUANTITY_FIELDS,
+    LotPolicy, Row, check_shape, clean_qty, label, load_lot_policy, note_inheritance, numeric_order, read_tables,
 )
 
 
@@ -21,13 +21,19 @@ DETAIL_TABLES = {"machine": MACHINE, "defect": DEFECT}
 IDENTITY_FIELDS = ("material_lot_no", "process_name", "process_key", "pass_order")
 COLUMN_PATTERN = re.compile(r"^工序0_([^_]+?)([0-9]+)_(.+)$", re.DOTALL)
 EXECUTION_PATTERN = re.compile(r"^执行([0-9]+)_(.+)$", re.DOTALL)
-# 机台设备仍按“机台设备1”“机台设备2”编号；不良改用名称做列名，只保留“不良_名称”前缀。
+# 机台设备仍按“机台设备1”“机台设备2”编号；不良按稳定代码排列。
 MACHINE_DETAIL_PATTERN = re.compile(r"^机台设备([0-9]+)_(.+)$", re.DOTALL)
 DEFECT_DETAIL_PATTERN = re.compile(r"^不良_(.+)$", re.DOTALL)
 
 
 @dataclass(frozen=True)
 class MaterialRule:
+    """一类材料工程的展示约定，字段与产品 JSON 的每个对象对应。
+
+    execution 按每次工程执行编号；material_lot 按不同材料编号，额外执行留在组内。
+    details 保存允许展开的表名，设备和不良是否展示由配置决定。
+    """
+
     name: str
     aliases: tuple[str, ...] = ()
     number_by: str = "execution"
@@ -45,12 +51,8 @@ def normalize_name(name: str) -> str:
     return re.sub(r"[\s_\-]+", "", name.casefold())
 
 
-@lru_cache(maxsize=1)
-def load_material_rules() -> tuple[MaterialRule, ...]:
-    """配置按数组顺序排列，服务重启时重新加载。"""
-    path = Path(__file__).with_name("material_rules.json")
+def parse_material_rules(definitions: list) -> tuple[MaterialRule, ...]:
     try:
-        definitions = json.loads(path.read_text(encoding="utf-8-sig"))
         if not isinstance(definitions, list) or not definitions:
             raise ValueError("需填写至少一种工程的规则")
         rules = []
@@ -77,8 +79,78 @@ def load_material_rules() -> tuple[MaterialRule, ...]:
             names.add(name)
             known_aliases.update(normalized)
         return tuple(rules)
-    except (OSError, KeyError, TypeError, ValueError, AttributeError) as error:
-        raise ValueError(f"材料工程规则 {path.name} 无法加载：{error}") from error
+    except (KeyError, TypeError, ValueError, AttributeError) as error:
+        raise ValueError(f"材料工程规则无效：{error}") from error
+
+
+@lru_cache(maxsize=32)
+def load_material_rules(product: str = "DFEC") -> tuple[MaterialRule, ...]:
+    """加载产品专用规则；缺少新产品文件时明确失败，防止误套 DFEC 规则。
+
+    缓存只用于减少重复解析，改动 JSON 后需重启服务。已创建任务还会保存快照，
+    后续离线重做优先使用快照，不受当前配置文件变化影响。
+    """
+    if not PROFILE_CODE.fullmatch(product):
+        raise ValueError("产品代码格式无效。")
+    name = "material_rules.json" if product == "DFEC" else f"material_rules_{product.lower()}.json"
+    path = Path(__file__).with_name(name)
+    try:
+        return parse_material_rules(json.loads(path.read_text(encoding="utf-8-sig")))
+    except (OSError, ValueError) as error:
+        raise ValueError(f"无法加载 {product} 的材料规则 {name}：{error}") from error
+
+
+@dataclass(frozen=True)
+class ExportRules:
+    """绑定产品、LOT 筛选和材料展示规则，作为任务配置快照的唯一来源。"""
+
+    product: str
+    lot: LotPolicy
+    materials: tuple[MaterialRule, ...]
+
+    def snapshot(self) -> dict:
+        # JSON 只记录业务规则，不包含数据库地址、账号或密码。
+        detail_names = {table: name for name, table in DETAIL_TABLES.items()}
+        return {
+            "version": 1, "product": self.product,
+            "lot_prefix": self.lot.prefix, "lot_prefix_once": self.lot.once,
+            "materials": [
+                {"name": rule.name, "aliases": list(rule.aliases), "number_by": rule.number_by,
+                 "details": [detail_names[table] for table in rule.details]}
+                for rule in self.materials
+            ],
+        }
+
+    @classmethod
+    def from_snapshot(cls, snapshot: dict) -> ExportRules:
+        if snapshot.get("version") != 1 or not PROFILE_CODE.fullmatch(snapshot.get("product", "")):
+            raise ValueError("任务的规则快照版本或产品代码无效。")
+        return cls(snapshot["product"], LotPolicy(snapshot["lot_prefix"], snapshot["lot_prefix_once"]),
+                   parse_material_rules(snapshot["materials"]))
+
+
+def load_export_rules(product: str = "DFEC") -> ExportRules:
+    return ExportRules(product, load_lot_policy(product), load_material_rules(product))
+
+
+def archive_rules(manifest: dict, product: str | None = None) -> ExportRules:
+    """优先还原存档快照；--product 不能覆盖快照中的产品身份。
+
+    无快照的存档才读取指定产品的当前配置。旧 DFEC 存档默认沿用原 E 前缀规则，
+    保证仅修改本地环境变量不会让历史文件在离线拼接时突然丢行。
+    """
+    if "rules" in manifest:
+        rules = ExportRules.from_snapshot(manifest["rules"])
+        if product is not None and product != rules.product:
+            raise ValueError("指定产品与存档中的规则快照不一致。")
+        return rules
+    recorded = manifest.get("product", "DFEC")
+    if product is not None and "product" in manifest and product != recorded:
+        raise ValueError("指定产品与存档的产品代码不一致。")
+    if product is not None or recorded != "DFEC":
+        return load_export_rules(product or recorded)
+    # 老存档使用当时固定的 E 规则；未提供产品时不套用当前环境变量。
+    return ExportRules("DFEC", LotPolicy(), load_material_rules())
 
 
 def material_rule(process_name: str, rules: tuple[MaterialRule, ...]) -> MaterialRule:
@@ -86,13 +158,13 @@ def material_rule(process_name: str, rules: tuple[MaterialRule, ...]) -> Materia
     return next((rule for rule in rules if normalized in rule.aliases), UNKNOWN)
 
 
-def material_column_key(column: str) -> tuple | None:
+def material_column_key(column: str, rules: tuple[MaterialRule, ...] | None = None) -> tuple | None:
     """将列名拆成工程、编号、执行和字段，按数字比较各级编号。"""
     match = COLUMN_PATTERN.fullmatch(column)
     if match is None:
         return None
     name, number, field = match.groups()
-    rules = load_material_rules() + FALLBACK_RULES
+    rules = (load_material_rules() if rules is None else rules) + FALLBACK_RULES
     order = next((i for i, rule in enumerate(rules) if rule.name == name), None)
     if order is None:
         # 制造数据也可能有道次 0，例如“工序0_材料1_seq”。
@@ -118,6 +190,7 @@ ExecutionKey = tuple[str, str, tuple[int, Decimal, str]]
 class MaterialExecution:
     rule: MaterialRule
     fields: Row
+    inheritance: dict[str, str | None]
 
 
 def material_usages(records: list[Row]) -> dict[str, list[str]]:
@@ -137,98 +210,73 @@ def execution_key(row: Row) -> ExecutionKey:
     return row["lot_no"], row["process_key"], numeric_order(row["pass_order"])
 
 
-def defect_naming(records: list[Row]) -> tuple[Callable[[str, str], str], bool]:
-    """不良名称适合做列名，但同名不同码或同码不同名时退回代码，避免歧义。
-
-    与制造工程一致：名称唯一时直接用名称做列名，名称有歧义时补上代码区分。
-    """
-    name_codes: dict[str, set[str]] = defaultdict(set)
-    code_names: dict[str, set[str]] = defaultdict(set)
-    for row in records:
-        name_codes[row["defect_name"]].add(row["defect_code"])
-        code_names[row["defect_code"]].add(row["defect_name"])
-    keep_name = any(
-        not name or len(code_names[code]) > 1
-        for name, codes in name_codes.items()
-        for code in codes
-    )
-
-    def title(code: str, defect_name: str) -> str:
-        if defect_name and len(code_names[code]) == 1:
-            text = label(defect_name)
-        else:
-            text = "代码" + label(code)
-        if defect_name and len(name_codes[defect_name]) > 1 and len(code_names[code]) == 1:
-            text += "_代码" + label(code)
-        return text
-
-    return title, keep_name
-
-
 def execution_fields(
     process: Row,
     details: dict[str, list[Row]],
     rule: MaterialRule,
-    naming: tuple[Callable[[str, str], str], bool],
-) -> Row:
-    """展开一次执行。不良以种类做列名，数量写在列下，代码另起子列。"""
+    *,
+    matched: bool,
+) -> tuple[Row, dict[str, str | None]]:
+    """保留明细原值，同时记录哪些列可从同一执行的工艺字段还原。
+
+    返回值分别是该次执行的字段，以及“明细字段 -> 父字段/None”的比较结果。
+    此处不直接删列：本材料相同的字段，在其他材料或后续分片中仍可能不同。
+    """
     fields = {field: process.get(field, "") for field in IDENTITY_FIELDS}
     fields["material_lot_no"] = process["lot_no"]
+    inheritance: dict[str, str | None] = {}
 
-    def add(name: str, value: str) -> None:
+    def add(name: str, field: str, value: str) -> None:
         if name in fields:
             raise ValueError(f"材料工程字段名冲突：{name}")
-        fields[name] = value
+        fields[name] = clean_qty(value) if field in QUANTITY_FIELDS else value
 
     for field, value in process.items():
         if value == "" or field in ("lot_no", "process_name", "process_key", "pass_order"):
             continue
-        # 工艺表若也有同名用料字段，另存原值，材料身份始终由该行 lot_no 确定。
-        add("工艺_material_lot_no" if field == "material_lot_no" else field, value)
+        add("工艺_material_lot_no" if field == "material_lot_no" else field, field, value)
 
     for source in rule.details:
         code_field = "machine_code" if source == MACHINE else "defect_code"
-        records = sorted(details.get(source, []), key=lambda r: (numeric_order(r[code_field]), r[code_field]))
-        if source == DEFECT:
-            title_of, keep_name = naming
-            repeats: Counter[str] = Counter()
-            for record in records:
-                code, defect_name = record["defect_code"], record["defect_name"]
+        records = sorted(details.get(source, []), key=lambda row: (numeric_order(row[code_field]), row[code_field]))
+        repeats: Counter[str] = Counter()
+        for number, record in enumerate(records, 1):
+            if source == DEFECT:
+                # 名称可能因改名或空白不同而变化；用原始代码固定列身份，名称放单元格。
+                code = record[code_field]
                 if not code:
                     raise ValueError("不良代码为空，无法确定项目身份")
-                title = title_of(code, defect_name)
-                repeats[title] += 1
-                position = repeats[title]
-                detail = "不良_" + title + (f"_记录{position}" if position > 1 else "")
-                # 同一种不良若出现多次，用“记录2”等后缀区分，不累计数量。
-                for field, value in record.items():
-                    if field in ("lot_no", "process_key", "pass_order", "defect_qty"):
-                        continue
-                    if field == "defect_name":
-                        if not keep_name:
-                            continue
-                        suffix = field
-                    elif field == "defect_code":
-                        suffix = "代码"
-                    else:
-                        if value == "":
-                            continue
-                        suffix = field
-                    add(f"{detail}_{suffix}", value)
-                add(detail, record.get("defect_qty", ""))
-            continue
-        for number, record in enumerate(records, 1):
-            prefix = f"{TABLES[source][0]}{number}_"
+                repeats[code] += 1
+                detail = "不良_代码" + label(code)
+                if repeats[code] > 1:
+                    detail += f"_记录{repeats[code]}"
+                add(detail, "defect_qty", record["defect_qty"])
+                add(detail + "_名称", "defect_name", record["defect_name"])
+                if not (record["defect_qty"] or record["defect_name"]):
+                    # 数量与名称都为空时，用原代码区分实际发生的记录与空槽位。
+                    add(detail + "_代码", "defect_code", code)
+            else:
+                detail = f"{TABLES[source][0]}{number}"
             for field, value in record.items():
-                # 关联键在本执行列组中已有对应字段，明细只补充自己的值。
-                if field not in ("lot_no", "process_key", "pass_order") and (value != "" or field == code_field):
-                    add(prefix + field, value)
-    return fields
+                if source == DEFECT and field in ("defect_qty", "defect_name", "defect_code"):
+                    continue
+                inheritable = field in BATCH_FIELDS or field in PROCESS_FIELDS
+                if not inheritable and value == "" and field != code_field:
+                    continue
+                column = f"{detail}_{field}"
+                add(column, field, value)
+                if inheritable:
+                    parent = "material_lot_no" if field == "lot_no" else field
+                    # 缺少机台代码时保留 LOT 作为实际明细存在的标识。
+                    has_identity = field != "lot_no" or bool(record[code_field])
+                    # 空字符串也要参与比较，不能把“父字段有值、明细为空”当成可继承。
+                    same = matched and has_identity and field in process and fields.get(parent) == value
+                    inheritance[column] = parent if same else None
+    return fields, inheritance
 
 
-def material_executions(tables: dict[str, list[Row]]) -> tuple[dict[str, list[MaterialExecution]], list[str]]:
+def material_executions(tables: dict[str, list[Row]], rules: tuple[MaterialRule, ...]) -> tuple[dict[str, list[MaterialExecution]], list[str]]:
     """为每个材料建立执行索引，供使用同一材料的各个制造 LOT 复用。"""
-    rules = load_material_rules()
     parents: dict[ExecutionKey, tuple[Row, MaterialRule]] = {}
     details: dict[ExecutionKey, dict[str, list[Row]]] = defaultdict(lambda: defaultdict(list))
     counts: Counter[str] = Counter()
@@ -253,14 +301,14 @@ def material_executions(tables: dict[str, list[Row]]) -> tuple[dict[str, list[Ma
                 details[key][source].append(record)
 
     by_lot: dict[str, list[MaterialExecution]] = defaultdict(list)
-    naming = defect_naming(tables[DEFECT])
     for key, (process, rule) in sorted(parents.items(), key=lambda item: (item[0][0], item[0][2], item[0][1])):
-        by_lot[key[0]].append(MaterialExecution(rule, execution_fields(process, details.get(key, {}), rule, naming)))
+        fields, inheritance = execution_fields(process, details.get(key, {}), rule, matched=rule != UNMATCHED)
+        by_lot[key[0]].append(MaterialExecution(rule, fields, inheritance))
 
     for row in tables[LOT]:
         if row["lot_no"] not in by_lot:
-            fields = execution_fields({"lot_no": row["lot_no"]}, {}, NO_PROCESS, naming)
-            by_lot[row["lot_no"]].append(MaterialExecution(NO_PROCESS, fields))
+            fields, inheritance = execution_fields({"lot_no": row["lot_no"]}, {}, NO_PROCESS, matched=False)
+            by_lot[row["lot_no"]].append(MaterialExecution(NO_PROCESS, fields, inheritance))
             counts["没有工程记录的材料 LOT"] += 1
 
     notices = [f"前工程有 {count} 条{reason}，已保留在对应列组" for reason, count in counts.items()]
@@ -273,6 +321,8 @@ def merge_and_attach_materials(
     rows: list[Row],
     records: list[Row],
     *,
+    rules: tuple[MaterialRule, ...],
+    inheritance: dict[str, str | None],
     max_columns: int | None = None,
     max_cells: int | None = None,
 ) -> tuple[list[str], list[str]]:
@@ -281,7 +331,7 @@ def merge_and_attach_materials(
     requested = {lot for materials in usages.values() for lot in materials}
     if any(record["lot_no"] not in requested for table in tables.values() for record in table):
         raise ValueError("前工程 CSV 包含用料关系中不存在的 LOT，请核对查询目录。")
-    executions, notices = material_executions(tables)
+    executions, notices = material_executions(tables, rules)
     missing = requested - executions.keys()
     if missing:
         notices.append(f"有 {len(missing)} 个材料 LOT 未查到前工程数据，制造用料列保留原编号")
@@ -290,6 +340,7 @@ def merge_and_attach_materials(
     added: set[str] = set()
     repeated: set[tuple[str, str]] = set()
     for row in rows:
+        # 编号在每个制造 LOT 内重新开始，不按整次任务累计，避免材料槽位无界增长。
         positions: Counter[str] = Counter()
         for lot in usages.get(row["lot_no"], ()):
             # 卷线按材料计数，额外执行留在该材料组内。执行计数型工程每次开新列组。
@@ -320,7 +371,10 @@ def merge_and_attach_materials(
                         check_shape(len(columns) + len(added) + 1, len(rows), max_columns, max_cells)
                         added.add(column)
                     row[column] = value
+                    if field in event.inheritance:
+                        parent = event.inheritance[field]
+                        note_inheritance(inheritance, column, prefix + parent if parent is not None else None)
 
     for name, count in sorted(Counter(name for name, _ in repeated).items()):
         notices.append(f"{name}有 {count} 个材料 LOT 出现多次执行，已保留在同一材料列组")
-    return [*columns, *sorted(added, key=material_column_key)], notices
+    return [*columns, *sorted(added, key=lambda column: material_column_key(column, rules))], notices

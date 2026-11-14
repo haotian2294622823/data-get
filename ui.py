@@ -75,7 +75,7 @@ with st.form("extract"):
     with number_col:
         product_number = st.text_input("品番", placeholder="输入完整品番")
     st.caption("至少填写一项 · 多项条件同时匹配")
-    st.caption("仅保留以大写 E 开头且整个 LOT 号只有一个大写 E 的系统批次，关联材料信息保留。")
+    st.caption("按所选产品的 LOT 规则筛选系统批次，材料按用料关系查找。")
     submitted = st.form_submit_button("查询并导出完整结果", icon=":material/search:", type="primary", width="stretch")
 
 if submitted:

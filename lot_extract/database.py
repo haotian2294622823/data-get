@@ -6,8 +6,8 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
-import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -17,24 +17,21 @@ from typing import Iterator
 from uuid import uuid4
 
 import psycopg
-from dotenv import load_dotenv
 from psycopg import sql
 
+from .material_merge import load_export_rules
 from .tables import (
-    LOT, MATERIAL, PRODUCT_FIELDS, TABLES, UPSTREAM_PREFIX, UPSTREAM_TABLES,
-    BoundedCsv, validate_columns,
+    BASE as BASE, PROFILE_CODE, LOT, LOT_WHITESPACE, MATERIAL, PRODUCT_FIELDS as PRODUCT_FIELDS,
+    TABLES, UPSTREAM_PREFIX, UPSTREAM_TABLES, BoundedCsv, LotPolicy, load_settings as load_settings,
+    validate_columns,
 )
 
-# 从代码文件定位项目根目录，避免换一个终端工作目录后找不到 .env。
-BASE = Path(__file__).resolve().parents[1]
-# 产品代码还会用于环境变量前缀和存档目录，因此只允许有限的安全字符。
-PROFILE_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,31}")
 # 每次从数据库游标取回的行数，不是整次查询的记录上限。
 FETCH_ROWS = 2048
 
 
-# 以下限制针对一次导出，而非数据库本身的总数据量。
-# 行数和原始 CSV 字节数覆盖系统七表 + 材料四表的总和；宽表另行检查大小。
+# 批处理按每个分片计算下面的记录、字节和单元格预算；它们不是全年任务上限。
+# 原始记录/字节覆盖系统七表 + 材料四表；DEFAULT_MAX_LOTS 只用于单次 fetch。
 DEFAULT_MAX_LOTS = 5_000
 DEFAULT_MAX_SOURCE_ROWS = 100_000
 DEFAULT_MAX_CSV_MIB = 640
@@ -97,9 +94,22 @@ class Filters:
         return sql.SQL(" AND ").join(clauses), parameters
 
 
-def load_settings() -> None:
-    """加载项目 .env；保留已有环境变量，不展开密码等值中的 ${...} 文本。"""
-    load_dotenv(BASE / ".env", interpolate=False)
+def system_lot_where(policy: LotPolicy) -> tuple[sql.Composable, list[str]]:
+    """把同一份 LotPolicy 转成参数化 SQL，供单次取数和分页共用。
+
+    C 排序规则使 LIKE 按大小写精确匹配，与 Python startswith 保持一致。
+    参数值独立传入，不把配置前缀直接拼进 SQL；材料回查不使用此过滤条件。
+    """
+    if policy.prefix == "*":
+        return sql.SQL("btrim(lot_no, %s) <> ''"), [LOT_WHITESPACE]
+    # 使用 ! 转义 LIKE 通配符，前缀中的 %、_ 和 ! 均按字面匹配。
+    prefix = policy.prefix.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+    condition = sql.SQL("""lot_no COLLATE "C" LIKE %s ESCAPE '!'""")
+    parameters = [prefix + "%"]
+    if policy.once:
+        condition += sql.SQL(""" AND lot_no COLLATE "C" NOT LIKE %s ESCAPE '!'""")
+        parameters.append(f"%{prefix}%{prefix}%")
+    return condition, parameters
 
 
 def products() -> tuple[str, ...]:
@@ -186,8 +196,10 @@ def archive_query(
     仅查直接使用的材料，不递归展开材料的上游；任一步骤失败就不发布该次存档。
     """
     where, params = filters.where()
-    where = sql.SQL("({}) AND lot_no LIKE %s AND lot_no NOT LIKE %s").format(where)
-    params = [*params, "E%", "%E%E%"]
+    rules = load_export_rules(product)
+    lot_condition, lot_params = system_lot_where(rules.lot)
+    where = sql.SQL("({}) AND ({})").format(where, lot_condition)
+    params.extend(lot_params)
     max_lots = limit("MAX_QUERY_LOTS", DEFAULT_MAX_LOTS)
     max_rows = limit("MAX_SOURCE_ROWS", DEFAULT_MAX_SOURCE_ROWS)
     max_bytes = limit("MAX_CSV_MIB", DEFAULT_MAX_CSV_MIB) * 1024 * 1024
@@ -279,6 +291,9 @@ def archive_query(
             for table in UPSTREAM_TABLES:
                 archive_by_lots(table, materials.values(), prefix=UPSTREAM_PREFIX)
 
+        (raw / "manifest.json").write_text(
+            json.dumps({"product": product, "rules": rules.snapshot()}, ensure_ascii=False, indent=2), encoding="utf-8",
+        )
         destination = root / product / query_id
         destination.parent.mkdir(exist_ok=True)
         raw.rename(destination)

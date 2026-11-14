@@ -12,24 +12,42 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import monotonic
 
-from .material_merge import material_column_key
-from .tables import is_system_lot
+from .material_merge import (
+    FALLBACK_RULES, ExportRules, MaterialRule, archive_rules, load_material_rules,
+    material_column_key, normalize_name,
+)
+from .tables import LotPolicy, inherited_columns, numeric_order
 
 
-def column_rank(column: str, position: int) -> tuple:
-    if key := material_column_key(column):
+def column_rank(column: str, position: int, rules: tuple[MaterialRule, ...] | None = None) -> tuple:
+    """统一列顺序；材料按产品配置排序，同时兼容旧版“工序0-”表头。"""
+    if key := material_column_key(column, rules):
         return (1, *key)
     material = re.match(r"^工序0-(.+?)_(\d+)(?:_|$)", column)
     if material:
         name, number = material.groups()
-        normalized = name.casefold().replace("-", "").replace(" ", "")
-        engineering = 0 if "ecore" in normalized else 1 if "icore" in normalized else 2 if "卷" in name or "winding" in normalized else 3
+        configured = (load_material_rules() if rules is None else rules) + FALLBACK_RULES
+        normalized = normalize_name(name)
+        engineering = next((i for i, rule in enumerate(configured)
+                            if normalized == normalize_name(rule.name) or normalized in rule.aliases),
+                           len(configured))
         return 1, engineering, name, int(number), position
+    if column.startswith("工序0-"):
+        configured = load_material_rules() if rules is None else rules
+        return 1, len(configured) + len(FALLBACK_RULES), column, 0, position
+    if rules is not None:
+        process = re.fullmatch(r"工序([^_]+)(?:_执行([0-9]+))?_(.+)", column, re.DOTALL)
+        if process:
+            field = process[3]
+            natural = tuple(int(part) if i % 2 else part
+                            for i, part in enumerate(re.split(r"([0-9]+)", field)))
+            return 2, numeric_order(process[1]), int(process[2] or "1"), natural, field
+        if column.startswith("未匹配"):
+            return 3, column
+        return 0, position
     process = re.match(r"^工序(\d+)(?:_执行(\d+))?_", column)
     if process:
         return 2, int(process[1]), int(process[2] or "1"), position
-    if column.startswith("工序0-"):
-        return 1, 4, column.split("_", 1)[0], 0, position
     if column.startswith("工序"):
         return 2, float("inf"), 1, position
     return (3 if column.startswith("未匹配") else 0), position
@@ -40,18 +58,33 @@ def join_parts(
     parts: list[dict],
     check: Callable[[], None],
     progress: Callable[[int, int], None],
+    *,
+    rules: ExportRules | None = None,
+    inheritance: dict[str, str | None] | None = None,
 ) -> dict:
-    """收集列名并逐行补空对齐；CSV 内容已转义，不重复做公式转义。"""
+    """先确定最终表头，再逐行按位置对齐；只在全部校验通过后发布 final.csv。
+
+    第一遍仅读各分片表头，结合全任务证据确定省略列；第二遍逐行读写实际数据。
+    内存保留列集合、每片指纹和当前行，不收集整个年度宽表。输入已做公式转义，
+    这里保留原文本，不能再次添加单引号。
+    """
     fields: dict[str, int] = {}
+    fingerprints = []
     for part in parts:
         check()
         with (directory / part["file"]).open(encoding="utf-8-sig", newline="") as stream:
             header = next(csv.reader(stream), [])
         if not header or "lot_no" not in header or len(header) != len(set(header)):
             raise ValueError(f"{part['file']} 的表头为空、缺少 LOT 或存在重复列。")
+        fingerprints.append(hashlib.sha256(json.dumps(header, ensure_ascii=False).encode()).digest())
         for field in header:
             fields.setdefault(field, len(fields))
-    columns = sorted(fields, key=lambda column: column_rank(column, fields[column]))
+    omitted = inherited_columns(fields, inheritance or {})
+    # 旧任务没有 inheritance 时不猜测重复列，仍可按原始列集合完成拼接。
+    material_rules = rules.materials if rules is not None else None
+    policy = rules.lot if rules is not None else LotPolicy()
+    columns = sorted((column for column in fields if column not in omitted),
+                     key=lambda column: column_rank(column, fields[column], material_rules))
     expected = sum(part["rows"] for part in parts)
     temporary = None
     rows = 0
@@ -65,18 +98,31 @@ def join_parts(
             temporary = Path(output.name)
             writer = csv.writer(output)
             writer.writerow(columns)
-            for part in parts:
+            for part, fingerprint in zip(parts, fingerprints, strict=True):
                 check()
                 count = 0
                 with (directory / part["file"]).open(encoding="utf-8-sig", newline="") as stream:
-                    reader = csv.DictReader(stream)
+                    reader = csv.reader(stream)
+                    header = next(reader, [])
+                    if hashlib.sha256(json.dumps(header, ensure_ascii=False).encode()).digest() != fingerprint:
+                        raise ValueError(f"{part['file']} 的表头在拼接期间发生变化。")
+                    width = len(header)
+                    positions = {name: index for index, name in enumerate(header)}
+                    lot_index = positions["lot_no"]
+                    # 每片只计算一次“最终列 -> 本片位置”。缺列指向 width，
+                    # 也就是后面追加的空字符串；表头完全一致时直接写原列表。
+                    indices = None if header == columns else [positions.get(column, width) for column in columns]
                     for row in reader:
                         check()
-                        if None in row or any(value is None for value in row.values()):
+                        if len(row) != width:
                             raise ValueError(f"{part['file']} 的行宽与表头不一致。")
-                        if not is_system_lot(row["lot_no"]):
-                            raise ValueError(f"{part['file']} 包含不满足仅以一个 E 开头规则的系统 LOT。")
-                        writer.writerow(row.get(column, "") for column in columns)
+                        if not policy.matches_csv(row[lot_index]):
+                            raise ValueError(f"{part['file']} 包含不符合产品规则的系统 LOT。")
+                        if indices is None:
+                            writer.writerow(row)
+                        else:
+                            row.append("")
+                            writer.writerow([row[index] for index in indices])
                         count += 1
                         rows += 1
                         if monotonic() - last_update >= 1:
@@ -89,6 +135,7 @@ def join_parts(
         progress(rows, expected)
         return {
             "file": destination.name, "rows": rows, "columns": len(columns),
+            "omitted_columns": omitted,
             "bytes": destination.stat().st_size,
             "schema_sha256": hashlib.sha256(json.dumps(columns, ensure_ascii=False).encode()).hexdigest(),
             "exceeds_excel_columns": len(columns) > 16384,
@@ -99,7 +146,7 @@ def join_parts(
             temporary.unlink(missing_ok=True)
 
 
-def join_saved_export(directory: Path) -> Path:
+def join_saved_export(directory: Path, *, product: str | None = None) -> Path:
     """离线拼接一个已完成的存档任务；已有完整结果时拒绝覆盖。"""
     root = Path(directory)
     manifest = root / "manifest.json"
@@ -112,7 +159,12 @@ def join_saved_export(directory: Path) -> Path:
         if Path(part["file"]).name != part["file"]:
             raise ValueError("清单中的分片文件名无效。")
     report = lambda done, total: print(f"{done}/{total}", flush=True)
-    state["final_csv"] = join_parts(root, state["parts"], lambda: None, report)
+    rules = archive_rules(state, product)
+    state["final_csv"] = join_parts(
+        root, state["parts"], lambda: None, report,
+        rules=rules if "rules" in state or product is not None or rules.product != "DFEC" else None,
+        inheritance=state.get("inheritance"),
+    )
     state["progress"], state["phase"] = 1.0, "complete"
     temporary = None
     try:

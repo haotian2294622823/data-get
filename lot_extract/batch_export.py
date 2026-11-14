@@ -24,13 +24,14 @@ from psycopg import sql
 
 from .database import (
     BASE, DEFAULT_MAX_CSV_MIB, DEFAULT_MAX_SOURCE_ROWS, DEFAULT_MAX_WIDE_CELLS,
-    MAX_WIDE_COLUMNS, Filters, database_snapshot, limit, products, read_rows, setting,
+    MAX_WIDE_COLUMNS, Filters, database_snapshot, limit, products, read_rows, setting, system_lot_where,
 )
 from .final_export import join_parts
+from .material_merge import load_export_rules
 from .merge import merge_tables, write_wide
 from .tables import (
     LOT, MATERIAL, TABLES, UPSTREAM_PREFIX, UPSTREAM_TABLES,
-    BoundedCsv, ExportSizeError, is_system_lot, validate_columns,
+    BoundedCsv, ExportSizeError, note_inheritance, validate_columns,
 )
 
 
@@ -61,7 +62,11 @@ def write_manifest(path: Path, state: dict) -> None:
 
 
 class MaterialCache:
-    """缓存四表原始行及“查过但无记录”的材料 LOT，内存不随全年材料数增长。"""
+    """在临时 SQLite 中缓存材料四表，跨批次复用同一快照下的查询结果。
+
+    lots 表表示“已经完整查过”，不表示一定有明细。已查无结果也应命中缓存，
+    避免缺失材料被反复回查。只在内存收集当前批次命中的 LOT，不保留全年集合。
+    """
 
     def __init__(self, path: Path):
         self.connection = sqlite3.connect(path)
@@ -77,16 +82,36 @@ class MaterialCache:
     def close(self) -> None:
         self.connection.close()
 
+    def lot_groups(self, materials: dict[str, object], *, reserved: int = 0) -> Iterable[list[str]]:
+        """分组生成 IN 参数；reserved 为 source 等额外参数预留位置。"""
+        # 给其他 SQL 参数留位置，每组大小也受当前连接的变量上限约束。
+        limit_variables = (
+            self.connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
+            if hasattr(self.connection, "getlimit") else 999
+        )
+        size = min(500, limit_variables - reserved)
+        if size < 1:
+            raise ValueError("SQLite 参数上限不足，无法查询材料缓存。")
+        lots = list(materials)
+        for start in range(0, len(lots), size):
+            yield lots[start:start + size]
+
     def ensure(self, connection, schema: str, materials: dict[str, object], max_rows: int, check: Callable) -> None:
-        missing = {
-            lot: value for lot, value in materials.items()
-            if self.connection.execute("SELECT 1 FROM lots WHERE lot=?", (lot,)).fetchone() is None
-        }
-        self.hits += len(materials) - len(missing)
+        """批量检查缓存，只向 PostgreSQL 查询未命中的材料并事务性写入四表。"""
+        cached = set()
+        for group in self.lot_groups(materials):
+            check()
+            placeholders = ",".join("?" for _ in group)
+            cached.update(lot for (lot,) in self.connection.execute(
+                f"SELECT lot FROM lots WHERE lot IN ({placeholders})", group
+            ))
+        missing = {lot: value for lot, value in materials.items() if lot not in cached}
         if not missing and self.connection.execute("SELECT COUNT(*) FROM headers").fetchone()[0] == len(UPSTREAM_TABLES):
+            self.hits += len(cached)
             return
         fetched = 0
-        # 四表全部读完才标记“已缓存”；失败时回滚，不能缓存截断的材料数据。
+        # 保留 SQLite 的事务回滚能力。取消、超限或查询失败时，四表及完成标记一并回滚，
+        # 拆批重试才不会命中半份数据；因此不能仅为写入速度关闭 journal。
         with self.connection:
             for source in UPSTREAM_TABLES:
                 check()
@@ -102,28 +127,35 @@ class MaterialCache:
                         "INSERT OR IGNORE INTO headers VALUES(?,?)", (source, json.dumps(fields))
                     )
                     index = fields.index("lot_no")
-                    for row in rows:
-                        check()
-                        fetched += 1
-                        if fetched > max_rows:
-                            raise ExportSizeError("材料原始记录超出单批上限。")
-                        values = ["" if value is None else str(value) for value in row]
-                        if values[index] not in missing:
-                            raise ValueError("材料查询返回了不属于本批用料关系的 LOT。")
-                        self.connection.execute(
-                            "INSERT INTO records(source,lot,data) VALUES(?,?,?)",
-                            (source, values[index], json.dumps(values, ensure_ascii=False)),
-                        )
+                    def records():
+                        # 生成器逐条供 executemany 消费，不再为待写入记录额外构建完整列表。
+                        nonlocal fetched
+                        for row in rows:
+                            check()
+                            fetched += 1
+                            if fetched > max_rows:
+                                raise ExportSizeError("材料原始记录超出单批上限。")
+                            values = ["" if value is None else str(value) for value in row]
+                            if values[index] not in missing:
+                                raise ValueError("材料查询返回了不属于本批用料关系的 LOT。")
+                            yield source, values[index], json.dumps(values, ensure_ascii=False)
+
+                    self.connection.executemany("INSERT INTO records(source,lot,data) VALUES(?,?,?)", records())
             self.connection.executemany("INSERT INTO lots VALUES(?)", ((lot,) for lot in missing))
+        self.hits += len(cached)
         self.misses += len(missing)
 
     def fields(self, source: str) -> list[str]:
         return json.loads(self.connection.execute("SELECT fields FROM headers WHERE source=?", (source,)).fetchone()[0])
 
-    def rows(self, source: str, materials: dict[str, object]) -> Iterable[list[str]]:
-        for lot in materials:
+    def rows(self, source: str, materials: dict[str, object], check: Callable) -> Iterable[list[str]]:
+        """每组一次 SELECT，再逐行解码；不为每个材料单独执行查询。"""
+        for group in self.lot_groups(materials, reserved=1):
+            check()
+            placeholders = ",".join("?" for _ in group)
             cursor = self.connection.execute(
-                "SELECT data FROM records WHERE source=? AND lot=? ORDER BY id", (source, lot)
+                f"SELECT data FROM records WHERE source=? AND lot IN ({placeholders}) ORDER BY lot, id",
+                [source, *group],
             )
             for (data,) in cursor:
                 yield json.loads(data)
@@ -166,10 +198,14 @@ def export_batches(
     progress: Callable[[dict], None] | None = None,
     cancel: Event | None = None,
 ) -> dict:
-    """分页读取 E 系统 LOT，批次超限时二分重试，单 LOT 超限则明确失败。"""
+    """分页读取系统 LOT，批次超限时二分重试，单 LOT 超限则明确失败。"""
     where, parameters = filters.where()
     if product not in products():
         raise ValueError("未配置该产品的数据库。")
+    rules = load_export_rules(product)
+    lot_condition, lot_parameters = system_lot_where(rules.lot)
+    where = sql.SQL("({}) AND ({})").format(where, lot_condition)
+    parameters.extend(lot_parameters)
     batch_size = batch_size if batch_size is not None else limit("EXPORT_BATCH_LOTS", 500)
     if not isinstance(batch_size, int) or isinstance(batch_size, bool) or not 1 <= batch_size <= 5000:
         raise ValueError("每批 LOT 数须在 1 到 5000 之间。")
@@ -197,7 +233,7 @@ def export_batches(
             "lot_no": filters.lot_no, "product_field": filters.product_field, "product": filters.product,
             "start": str(filters.start) if filters.start else None, "end": str(filters.end) if filters.end else None,
         },
-        "batch_size": batch_size,
+        "batch_size": batch_size, "rules": rules.snapshot(), "inheritance": {},
     }
     started = perf_counter()
 
@@ -247,19 +283,29 @@ def export_batches(
                             publish(f"正在读取或复用 {len(writer.materials)} 个材料 LOT")
                             cache.ensure(connection, schema, writer.materials, max_rows, check)
                             for table in UPSTREAM_TABLES:
-                                writer.write(table, cache.fields(table), cache.rows(table, writer.materials), UPSTREAM_PREFIX)
+                                writer.write(table, cache.fields(table), cache.rows(table, writer.materials, check), UPSTREAM_PREFIX)
                             material_seconds = perf_counter() - phase_started
                             phase_started = perf_counter()
                             publish(f"正在合并 {len(lots)} 个系统 LOT")
-                            columns, rows, notices = merge_tables(raw, max_columns=MAX_WIDE_COLUMNS, max_cells=max_cells)
+                            inheritance: dict[str, str | None] = {}
+                            # 本次尝试单独收集比较结果。失败后拆批时，不能把失败的证据带入任务。
+                            columns, rows, notices = merge_tables(
+                                raw, max_columns=MAX_WIDE_COLUMNS, max_cells=max_cells,
+                                rules=rules, inheritance=inheritance,
+                            )
                             merge_seconds = perf_counter() - phase_started
                             phase_started = perf_counter()
-                            if len(rows) != len(lots) or any(not is_system_lot(row["lot_no"]) for row in rows):
+                            if len(rows) != len(lots) or any(not rules.lot.matches(row["lot_no"]) for row in rows):
                                 raise ValueError("合并结果的系统 LOT 数量或前缀与本批查询不一致。")
                             with (raw / "wide.csv").open("wb") as stream:
                                 write_wide(BoundedCsv(stream, part_bytes, "单个宽表分片"), columns, rows)
                             check()
                             destination = directory / f"{part_id}.csv"
+                            # 每个原始分片也可脱离任务根目录离线重做。
+                            (raw / "manifest.json").write_text(
+                                json.dumps({"product": product, "rules": state["rules"]}, ensure_ascii=False),
+                                encoding="utf-8",
+                            )
                             os.replace(raw / "wide.csv", destination)
                             os.replace(raw, archives / part_id)
                             state["parts"].append({
@@ -274,6 +320,10 @@ def export_batches(
                                 "merge_seconds": round(merge_seconds, 3),
                                 "write_seconds": round(perf_counter() - phase_started, 3),
                             })
+                            for column in columns:
+                                # 文件成功落盘后才累计任务级证据。没有证据的列也登记 None，
+                                # 防止同名列在另一个分片中被误当成可以从父字段还原。
+                                note_inheritance(state["inheritance"], column, inheritance.get(column))
                             state["rows"] += len(rows)
                             state["cache_hits"], state["cache_misses"] = cache.hits, cache.misses
                             publish(f"已整理 {state['rows']:,} 行数据")
@@ -288,12 +338,12 @@ def export_batches(
                 last_lot = ""
                 while True:
                     check()
-                    publish("正在读取下一批 E 开头系统 LOT")
+                    publish("正在读取下一批系统 LOT")
                     statement = sql.SQL(
-                        "SELECT * FROM {} WHERE ({}) AND lot_no LIKE %s AND lot_no NOT LIKE %s AND lot_no > %s ORDER BY lot_no LIMIT %s"
+                        "SELECT * FROM {} WHERE ({}) AND lot_no > %s ORDER BY lot_no LIMIT %s"
                     ).format(sql.Identifier(schema, LOT), where)
                     lookup_started = perf_counter()
-                    with read_rows(connection, statement, [*parameters, "E%", "%E%E%", last_lot, batch_size + 1]) as (fields, records):
+                    with read_rows(connection, statement, [*parameters, last_lot, batch_size + 1]) as (fields, records):
                         validate_columns(LOT, fields)
                         lots = list(records)
                     state["lot_lookup_seconds"] += perf_counter() - lookup_started
@@ -301,8 +351,8 @@ def export_batches(
                         break
                     index = fields.index("lot_no")
                     keys = [str(row[index]) for row in lots]
-                    if len(keys) != len(set(keys)) or any(not is_system_lot(key) for key in keys):
-                        raise ValueError("批次表存在重复 LOT 或 LOT 不是仅以一个 E 开头，不能可靠分页。")
+                    if len(keys) != len(set(keys)) or any(not rules.lot.matches(key) for key in keys):
+                        raise ValueError("批次表存在重复 LOT 或 LOT 不符合产品规则，不能可靠分页。")
                     page = lots[:batch_size]
                     # 只统计本页实际处理的 LOT；多取的一条用于判断下一页，
                     # 超限后的拆批重试也不能重复累计这个数量。
@@ -325,13 +375,15 @@ def export_batches(
                 publish(f"正在生成完整 CSV：{done:,}/{total:,} 行")
 
             join_started = perf_counter()
-            state["final_csv"] = join_parts(directory, state["parts"], check, join_progress)
+            state["final_csv"] = join_parts(
+                directory, state["parts"], check, join_progress, rules=rules, inheritance=state["inheritance"],
+            )
             state["join_seconds"] = round(perf_counter() - join_started, 3)
 
         state["lot_lookup_seconds"] = round(state["lot_lookup_seconds"], 3)
         state["status"] = "complete"
         state["phase"] = "complete"
-        publish("导出完成，已生成一份完整宽表" if state["rows"] else "没有符合条件的 E 开头系统 LOT")
+        publish("导出完成，已生成一份完整宽表" if state["rows"] else "没有符合条件的系统 LOT")
         return state
     except (Exception, KeyboardInterrupt) as error:
         state["status"] = "cancelled" if isinstance(error, (ExportCancelled, KeyboardInterrupt)) else "failed"

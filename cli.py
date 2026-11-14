@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 from datetime import date
 from pathlib import Path
 
-from lot_extract.tables import PRODUCT_FIELDS
+from lot_extract.tables import PRODUCT_FIELDS, load_settings
 
 
 def export_command(args: argparse.Namespace) -> None:
     # 数据库相关依赖只在取数命令中加载，查看帮助或离线合并无需数据库驱动。
     from lot_extract.batch_export import export_batches
-    from lot_extract.database import Filters, load_settings
+    from lot_extract.database import Filters
 
     load_settings()
     filters = Filters(args.lot, args.field, args.number, args.start, args.end)
@@ -21,13 +22,13 @@ def export_command(args: argparse.Namespace) -> None:
         filters, args.product, batch_size=args.batch_size, directory=args.output_directory,
         progress=lambda state: print(state["stage"], flush=True),
     )
-    print(f"已完成：{result['rows']} 个 E 系统 LOT。结果目录：{result['directory']}")
+    print(f"已完成：{result['rows']} 个系统 LOT。结果目录：{result['directory']}")
     if result.get("final_csv"):
         print("完整宽表：final.csv。分片仅作中间存档。")
 
 
 def fetch_command(args: argparse.Namespace) -> None:
-    from lot_extract.database import Filters, archive_query, load_settings, products
+    from lot_extract.database import Filters, archive_query, products
 
     load_settings()
     lot_no = args.lot_no if args.lot_no is not None else input("系统 LOT: ")
@@ -38,20 +39,35 @@ def fetch_command(args: argparse.Namespace) -> None:
 def merge_command(args: argparse.Namespace) -> None:
     from lot_extract.merge import merge_csv
 
-    merge_csv(args.directory, args.output)
+    if args.product is not None:
+        load_settings()
+    merge_csv(args.directory, args.output, product=args.product)
 
 
 def join_command(args: argparse.Namespace) -> None:
     from lot_extract.final_export import join_saved_export
 
-    destination = join_saved_export(args.directory)
+    if args.product is not None:
+        load_settings()
+    destination = join_saved_export(args.directory, product=args.product)
     print(f"完整 CSV：{destination}")
 
 
 def filter_command(args: argparse.Namespace) -> None:
-    from lot_extract.tables import filter_csv
+    from lot_extract.material_merge import archive_rules
+    from lot_extract.tables import LotPolicy, filter_csv, load_lot_policy
 
-    filter_csv(args.source, args.output)
+    manifest = args.source.parent / "manifest.json"
+    state = json.loads(manifest.read_text(encoding="utf-8")) if manifest.is_file() else {}
+    if args.product is not None:
+        load_settings()
+    if state.get("final_csv", {}).get("file") == args.source.name and "rules" in state:
+        policy = archive_rules(state, args.product).lot
+    elif args.product is not None:
+        policy = load_lot_policy(args.product)
+    else:
+        policy = LotPolicy()
+    filter_csv(args.source, args.output, policy=policy)
 
 
 def main() -> None:
@@ -77,15 +93,18 @@ def main() -> None:
     merge = commands.add_parser("merge", help="把原始 CSV 存档合并成宽表，无需数据库")
     merge.add_argument("directory", nargs="?", type=Path, help="默认读取项目目录")
     merge.add_argument("--output", type=Path)
+    merge.add_argument("--product", type=str.upper, help="无规则快照时使用指定产品")
     merge.set_defaults(run=merge_command)
 
     join = commands.add_parser("join", help="把已完成任务的中间结果拼接成完整 CSV")
     join.add_argument("directory", type=Path, help="包含 manifest.json 的已完成任务目录")
+    join.add_argument("--product", type=str.upper, help="无规则快照时使用指定产品")
     join.set_defaults(run=join_command)
 
     filter_rows = commands.add_parser("filter", help="对已有 CSV 应用系统 LOT 筛选规则")
     filter_rows.add_argument("source", type=Path)
     filter_rows.add_argument("--output", type=Path)
+    filter_rows.add_argument("--product", type=str.upper, help="使用指定产品的 LOT 筛选规则")
     filter_rows.set_defaults(run=filter_command)
 
     args = parser.parse_args()
